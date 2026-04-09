@@ -1,0 +1,258 @@
+# Agent 1: Upstream Sync
+#
+# Autonomously monitors the upstream repository (jundot/omlx) for new releases.
+# When a new release is detected, it rebases the fork-specific commits on top of
+# the upstream release tag and opens a PR for Agent 2 to verify.
+#
+# Commit provenance is preserved: the rebase maintains the original fork commit
+# hashes in the PR body so reviewers can trace exactly where fork-specific changes
+# land relative to the upstream commit chain.
+
+name: "Agent 1: Upstream Sync"
+
+on:
+  # Poll every 6 hours for new upstream releases
+  schedule:
+    - cron: "0 */6 * * *"
+  # Allow manual trigger for testing
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+env:
+  UPSTREAM_REPO: jundot/omlx
+  UPSTREAM_REMOTE: upstream
+  FORK_BRANCH: main
+  SYNC_BRANCH_PREFIX: sync/upstream-
+
+jobs:
+  check-and-sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.FORK_BRANCH }}
+          # Full history is required for rebase operations
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Iron Proxy
+        uses: ironsh/iron-proxy-action@v1
+        with:
+          egress-rules: egress-rules.yaml
+          warn: "false"
+
+      - name: Configure git identity
+        run: |
+          git config user.name "oval-x-sync[bot]"
+          git config user.email "oval-x-sync[bot]@users.noreply.github.com"
+
+      - name: Add upstream remote
+        run: |
+          git remote add "$UPSTREAM_REMOTE" "https://github.com/${UPSTREAM_REPO}.git"
+          git fetch "$UPSTREAM_REMOTE" --tags
+
+      - name: Detect latest upstream release tag
+        id: detect
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Get the latest release tag from upstream via GitHub API
+          LATEST_TAG=$(gh release view --repo "$UPSTREAM_REPO" --json tagName -q '.tagName')
+          if [ -z "$LATEST_TAG" ]; then
+            echo "::error::Could not determine latest upstream release tag"
+            exit 1
+          fi
+          echo "latest_tag=$LATEST_TAG" >> "$GITHUB_OUTPUT"
+          echo "Detected latest upstream release: $LATEST_TAG"
+
+          # Determine the sync branch name for this release
+          SYNC_BRANCH="${SYNC_BRANCH_PREFIX}${LATEST_TAG}"
+          echo "sync_branch=$SYNC_BRANCH" >> "$GITHUB_OUTPUT"
+
+      - name: Check if already synced
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          LATEST_TAG="${{ steps.detect.outputs.latest_tag }}"
+          SYNC_BRANCH="${{ steps.detect.outputs.sync_branch }}"
+
+          # Check if this tag's commit is already an ancestor of our main branch.
+          # If it is, we are already up to date with this release.
+          UPSTREAM_TAG_SHA=$(git rev-parse "refs/tags/${LATEST_TAG}" 2>/dev/null || echo "")
+          if [ -z "$UPSTREAM_TAG_SHA" ]; then
+            echo "::error::Tag $LATEST_TAG not found after fetch"
+            exit 1
+          fi
+          echo "upstream_tag_sha=$UPSTREAM_TAG_SHA" >> "$GITHUB_OUTPUT"
+
+          if git merge-base --is-ancestor "$UPSTREAM_TAG_SHA" HEAD; then
+            echo "Already synced with upstream $LATEST_TAG"
+            echo "needs_sync=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Check if a sync branch or open PR already exists for this tag
+          EXISTING_PR=$(gh pr list --head "$SYNC_BRANCH" --state open --json number -q '.[0].number' 2>/dev/null || echo "")
+          if [ -n "$EXISTING_PR" ]; then
+            echo "Open PR #$EXISTING_PR already exists for $SYNC_BRANCH"
+            echo "needs_sync=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "needs_sync=true" >> "$GITHUB_OUTPUT"
+
+      - name: Identify fork-specific commits
+        if: steps.check.outputs.needs_sync == 'true'
+        id: fork-commits
+        run: |
+          LATEST_TAG="${{ steps.detect.outputs.latest_tag }}"
+
+          # Find the merge base between our fork's main and the upstream tag.
+          # All commits on our side after this point are fork-specific.
+          MERGE_BASE=$(git merge-base HEAD "$UPSTREAM_REMOTE/$FORK_BRANCH" 2>/dev/null || \
+                       git merge-base HEAD "refs/tags/${LATEST_TAG}" 2>/dev/null || echo "")
+
+          if [ -z "$MERGE_BASE" ]; then
+            # Fallback: find the newest tag that IS an ancestor of HEAD
+            # This handles the case where upstream/main doesn't exist
+            MERGE_BASE=$(git merge-base HEAD "refs/tags/${LATEST_TAG}^" 2>/dev/null || echo "")
+          fi
+
+          if [ -z "$MERGE_BASE" ]; then
+            echo "::warning::Could not find merge base. Assuming all commits are fork-specific."
+            # Use the root commit as the base
+            MERGE_BASE=$(git rev-list --max-parents=0 HEAD | tail -1)
+          fi
+
+          echo "merge_base=$MERGE_BASE" >> "$GITHUB_OUTPUT"
+
+          # Record the fork-specific commits for the PR body (preserves provenance)
+          FORK_COMMITS=$(git log --oneline "${MERGE_BASE}..HEAD" 2>/dev/null || echo "(none)")
+          echo "fork_commit_count=$(echo "$FORK_COMMITS" | grep -c '.' || echo 0)" >> "$GITHUB_OUTPUT"
+
+          # Store to file for the PR body (multi-line output)
+          echo "$FORK_COMMITS" > /tmp/fork-commits.txt
+          echo "Fork-specific commits to rebase:"
+          cat /tmp/fork-commits.txt
+
+      - name: Rebase fork commits onto upstream release
+        if: steps.check.outputs.needs_sync == 'true'
+        id: rebase
+        run: |
+          LATEST_TAG="${{ steps.detect.outputs.latest_tag }}"
+          SYNC_BRANCH="${{ steps.detect.outputs.sync_branch }}"
+          MERGE_BASE="${{ steps.fork-commits.outputs.merge_base }}"
+
+          # Create the sync branch starting from the upstream release tag
+          git checkout -b "$SYNC_BRANCH" "refs/tags/${LATEST_TAG}"
+
+          # If there are fork-specific commits, replay them on top
+          FORK_COUNT="${{ steps.fork-commits.outputs.fork_commit_count }}"
+          if [ "$FORK_COUNT" -gt 0 ] && [ "$MERGE_BASE" != "$(git rev-parse HEAD)" ]; then
+            echo "Rebasing $FORK_COUNT fork-specific commit(s) onto $LATEST_TAG..."
+
+            # Collect commit list first to avoid subshell issues with pipes
+            COMMIT_LIST=$(git rev-list --reverse "${MERGE_BASE}..origin/${FORK_BRANCH}" --no-merges)
+
+            # Cherry-pick each fork commit to preserve authorship and message.
+            # Using cherry-pick instead of rebase --onto to handle merge commits
+            # and maintain a linear history on the sync branch.
+            for COMMIT_SHA in $COMMIT_LIST; do
+              echo "Cherry-picking $COMMIT_SHA: $(git log -1 --format='%s' "$COMMIT_SHA")"
+              if ! git cherry-pick "$COMMIT_SHA" --allow-empty; then
+                echo "::warning::Conflict cherry-picking $COMMIT_SHA."
+                echo "Unresolved conflicts detected. Aborting cherry-pick."
+                git cherry-pick --abort
+                echo "conflict=true" >> "$GITHUB_OUTPUT"
+                echo "conflict_commit=$COMMIT_SHA" >> "$GITHUB_OUTPUT"
+                echo "conflict_message=$(git log -1 --format='%s' "$COMMIT_SHA")" >> "$GITHUB_OUTPUT"
+                break
+              fi
+            done
+          else
+            echo "No fork-specific commits to rebase. Sync branch is a clean upstream tag."
+          fi
+
+          echo "rebase_head=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Push sync branch
+        if: steps.check.outputs.needs_sync == 'true'
+        run: |
+          SYNC_BRANCH="${{ steps.detect.outputs.sync_branch }}"
+          git push origin "$SYNC_BRANCH" --force-with-lease
+
+      - name: Open pull request
+        if: steps.check.outputs.needs_sync == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          LATEST_TAG="${{ steps.detect.outputs.latest_tag }}"
+          SYNC_BRANCH="${{ steps.detect.outputs.sync_branch }}"
+          UPSTREAM_TAG_SHA="${{ steps.check.outputs.upstream_tag_sha }}"
+          MERGE_BASE="${{ steps.fork-commits.outputs.merge_base }}"
+          FORK_COUNT="${{ steps.fork-commits.outputs.fork_commit_count }}"
+          CONFLICT="${{ steps.rebase.outputs.conflict }}"
+          CONFLICT_COMMIT="${{ steps.rebase.outputs.conflict_commit }}"
+          CONFLICT_MSG="${{ steps.rebase.outputs.conflict_message }}"
+          REBASE_HEAD="${{ steps.rebase.outputs.rebase_head }}"
+          FORK_COMMITS=$(cat /tmp/fork-commits.txt 2>/dev/null || echo "(none)")
+
+          # Build conflict warning section if applicable
+          CONFLICT_SECTION=""
+          if [ "$CONFLICT" = "true" ]; then
+            CONFLICT_SECTION=$(cat <<INNER
+          > **Warning**: Rebase encountered a conflict at commit \`${CONFLICT_COMMIT}\` ("${CONFLICT_MSG}").
+          > Manual resolution is required before this PR can be merged.
+          INNER
+          )
+          fi
+
+          # Build labels
+          LABELS="upstream-sync,automated"
+          if [ "$CONFLICT" = "true" ]; then
+            LABELS="${LABELS},needs-manual-resolution"
+          fi
+
+          gh pr create \
+            --base "$FORK_BRANCH" \
+            --head "$SYNC_BRANCH" \
+            --title "sync: rebase onto upstream ${LATEST_TAG}" \
+            --label "$LABELS" \
+            --body "$(cat <<EOF
+          ## Upstream Sync: ${LATEST_TAG}
+
+          This PR was automatically generated by **Agent 1 (Upstream Sync)**.
+
+          ### What happened
+          - Detected new upstream release: [\`${LATEST_TAG}\`](https://github.com/${UPSTREAM_REPO}/releases/tag/${LATEST_TAG})
+          - Upstream tag commit: \`${UPSTREAM_TAG_SHA}\`
+          - Fork-specific commits were cherry-picked on top of the upstream tag to preserve provenance.
+
+          ${CONFLICT_SECTION}
+
+          ### Fork commit provenance
+
+          The following fork-specific commits (${FORK_COUNT}) were rebased onto \`${LATEST_TAG}\`:
+
+          \`\`\`
+          ${FORK_COMMITS}
+          \`\`\`
+
+          - **Merge base (divergence point)**: \`${MERGE_BASE}\`
+          - **New HEAD after rebase**: \`${REBASE_HEAD}\`
+
+          ### Next steps
+          **Agent 2 (Verification)** will automatically validate this PR and, if the rebase is correct, merge it and cut a release.
+
+          ---
+          *This PR is managed by the Oval X autonomous fork sync pipeline.*
+          EOF
+          )"
+
+      - name: Egress summary
+        uses: ironsh/iron-proxy-action/summary@v1
+        if: always()

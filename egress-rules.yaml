@@ -1,0 +1,15 @@
+# Egress rules for Oval X fork management agents.
+# Only domains required for git operations, GitHub API, and release management.
+domains:
+  # GitHub (core platform + API)
+  - "github.com"
+  - "*.github.com"
+  - "api.github.com"
+  - "uploads.github.com"
+  - "*.githubusercontent.com"
+  - "*.actions.githubusercontent.com"
+  - "*.pkg.github.com"
+  - "*.blob.core.windows.net"
+
+  # GitHub CLI (gh) release asset downloads
+  - "objects.githubusercontent.com"

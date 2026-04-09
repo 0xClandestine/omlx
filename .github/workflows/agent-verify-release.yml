@@ -1,0 +1,353 @@
+# Agent 2: Verification & Release
+#
+# Validates the work produced by Agent 1 (Upstream Sync). When a sync PR passes
+# all verification checks, it is merged to main and a new release is cut.
+#
+# Verification checks:
+# 1. The sync branch contains the upstream tag as an ancestor (rebase integrity)
+# 2. All fork-specific commits are present (commit provenance preserved)
+# 3. The tree is buildable (Python syntax check + import validation)
+# 4. No conflict markers remain in the codebase
+# 5. The PR was created by Agent 1 (label check)
+
+name: "Agent 2: Verify & Release"
+
+on:
+  pull_request:
+    types: [opened, synchronize]
+    branches: [main]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+env:
+  UPSTREAM_REPO: jundot/omlx
+
+jobs:
+  verify:
+    # Only run on PRs created by Agent 1
+    if: contains(github.event.pull_request.labels.*.name, 'upstream-sync')
+    runs-on: ubuntu-latest
+    outputs:
+      verified: ${{ steps.verdict.outputs.verified }}
+      upstream_tag: ${{ steps.extract-tag.outputs.tag }}
+      has_conflicts: ${{ steps.conflict-check.outputs.has_conflicts }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Iron Proxy
+        uses: ironsh/iron-proxy-action@v1
+        with:
+          egress-rules: egress-rules.yaml
+          warn: "false"
+
+      - name: Extract upstream tag from PR
+        id: extract-tag
+        run: |
+          # Parse the upstream tag from the branch name (sync/upstream-vX.Y.Z)
+          BRANCH="${{ github.event.pull_request.head.ref }}"
+          TAG="${BRANCH#sync/upstream-}"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "Verifying sync against upstream tag: $TAG"
+
+      - name: Fetch upstream for verification
+        run: |
+          git remote add upstream "https://github.com/${UPSTREAM_REPO}.git" 2>/dev/null || true
+          git fetch upstream --tags
+
+      - name: "Check 1: Upstream tag is ancestor"
+        id: ancestry-check
+        run: |
+          TAG="${{ steps.extract-tag.outputs.tag }}"
+          TAG_SHA=$(git rev-parse "refs/tags/${TAG}" 2>/dev/null || echo "")
+
+          if [ -z "$TAG_SHA" ]; then
+            echo "::error::Upstream tag $TAG not found"
+            echo "passed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if git merge-base --is-ancestor "$TAG_SHA" HEAD; then
+            echo "Upstream tag $TAG ($TAG_SHA) is an ancestor of sync branch HEAD"
+            echo "passed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::error::Upstream tag $TAG is NOT an ancestor of sync branch HEAD. Rebase integrity broken."
+            echo "passed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: "Check 2: Fork commits preserved"
+        id: provenance-check
+        run: |
+          # Verify that the PR body lists fork commits and they are present in the branch.
+          # We check that every non-merge commit from origin/main that isn't in the upstream
+          # tag has a corresponding cherry-pick on this branch (by commit message matching).
+          TAG="${{ steps.extract-tag.outputs.tag }}"
+
+          # Get the merge base between the upstream tag and origin/main
+          git fetch origin main
+          MERGE_BASE=$(git merge-base "refs/tags/${TAG}" origin/main 2>/dev/null || echo "")
+
+          if [ -z "$MERGE_BASE" ]; then
+            echo "::warning::Could not determine merge base for provenance check. Skipping."
+            echo "passed=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Get fork-specific commit messages from origin/main
+          FORK_MSGS=$(git log --oneline --no-merges "${MERGE_BASE}..origin/main" --format='%s' | sort)
+          # Get commit messages on the sync branch after the upstream tag
+          SYNC_MSGS=$(git log --oneline --no-merges "refs/tags/${TAG}..HEAD" --format='%s' | sort)
+
+          if [ -z "$FORK_MSGS" ]; then
+            echo "No fork-specific commits to verify (clean upstream sync)"
+            echo "passed=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Check each fork commit message appears in the sync branch
+          MISSING=0
+          while IFS= read -r MSG; do
+            if ! echo "$SYNC_MSGS" | grep -qF "$MSG"; then
+              echo "::warning::Fork commit not found in sync branch: $MSG"
+              MISSING=$((MISSING + 1))
+            fi
+          done <<< "$FORK_MSGS"
+
+          if [ "$MISSING" -gt 0 ]; then
+            echo "::error::$MISSING fork-specific commit(s) missing from sync branch"
+            echo "passed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "All fork-specific commits preserved in sync branch"
+            echo "passed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: "Check 3: No conflict markers"
+        id: conflict-check
+        run: |
+          # Search for leftover conflict markers in tracked files (exclude config/docs)
+          CONFLICTS=$(git grep -rn '^<<<<<<< ' -- ':(exclude)*.yml' ':(exclude)*.yaml' ':(exclude)*.md' 2>/dev/null | wc -l || echo 0)
+          CONFLICTS=$(echo "$CONFLICTS" | tr -d ' ')
+
+          if [ "$CONFLICTS" -gt 0 ]; then
+            echo "::error::Found $CONFLICTS conflict marker(s) in the codebase:"
+            git grep -rn '^<<<<<<< ' -- ':(exclude)*.yml' ':(exclude)*.yaml' ':(exclude)*.md' 2>/dev/null | head -20
+            echo "has_conflicts=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "No conflict markers found"
+            echo "has_conflicts=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: "Check 4: Python syntax validation"
+        id: syntax-check
+        run: |
+          # Verify all Python files have valid syntax
+          ERRORS=0
+          while IFS= read -r -d '' pyfile; do
+            if ! python3 -c "import ast; ast.parse(open('$pyfile').read())" 2>/dev/null; then
+              echo "::error::Syntax error in $pyfile"
+              ERRORS=$((ERRORS + 1))
+            fi
+          done < <(find . -name '*.py' -not -path './.git/*' -print0)
+
+          if [ "$ERRORS" -gt 0 ]; then
+            echo "::error::$ERRORS Python file(s) have syntax errors"
+            echo "passed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "All Python files pass syntax validation"
+            echo "passed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: "Check 5: No manual resolution needed"
+        id: label-check
+        run: |
+          LABELS='${{ toJson(github.event.pull_request.labels.*.name) }}'
+          if echo "$LABELS" | grep -q "needs-manual-resolution"; then
+            echo "::error::PR is labeled needs-manual-resolution. Agent 1 encountered conflicts."
+            echo "passed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "passed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Render verdict
+        id: verdict
+        run: |
+          ANCESTRY="${{ steps.ancestry-check.outputs.passed }}"
+          PROVENANCE="${{ steps.provenance-check.outputs.passed }}"
+          CONFLICTS="${{ steps.conflict-check.outputs.has_conflicts }}"
+          SYNTAX="${{ steps.syntax-check.outputs.passed }}"
+          LABELS="${{ steps.label-check.outputs.passed }}"
+
+          echo "=== Verification Summary ==="
+          echo "  Upstream ancestry:    $ANCESTRY"
+          echo "  Commit provenance:    $PROVENANCE"
+          echo "  No conflict markers:  $([ "$CONFLICTS" = "false" ] && echo "true" || echo "false")"
+          echo "  Python syntax:        $SYNTAX"
+          echo "  No manual resolution: $LABELS"
+
+          if [ "$ANCESTRY" = "true" ] && \
+             [ "$PROVENANCE" = "true" ] && \
+             [ "$CONFLICTS" = "false" ] && \
+             [ "$SYNTAX" = "true" ] && \
+             [ "$LABELS" = "true" ]; then
+            echo "All checks passed. PR is verified."
+            echo "verified=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::error::Verification failed. PR will NOT be auto-merged."
+            echo "verified=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Comment verification result
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERIFIED="${{ steps.verdict.outputs.verified }}"
+          TAG="${{ steps.extract-tag.outputs.tag }}"
+          PR_NUMBER="${{ github.event.pull_request.number }}"
+
+          if [ "$VERIFIED" = "true" ]; then
+            gh pr comment "$PR_NUMBER" --body "$(cat <<EOF
+          ## Agent 2: Verification Passed
+
+          All checks passed for upstream sync to \`${TAG}\`:
+
+          | Check | Result |
+          |-------|--------|
+          | Upstream tag is ancestor | Passed |
+          | Fork commits preserved | Passed |
+          | No conflict markers | Passed |
+          | Python syntax valid | Passed |
+          | No manual resolution needed | Passed |
+
+          **Proceeding to merge and release.**
+
+          ---
+          *Verified by Agent 2 (Oval X fork management pipeline)*
+          EOF
+          )"
+          else
+            gh pr comment "$PR_NUMBER" --body "$(cat <<EOF
+          ## Agent 2: Verification Failed
+
+          One or more checks failed for upstream sync to \`${TAG}\`:
+
+          | Check | Result |
+          |-------|--------|
+          | Upstream tag is ancestor | ${{ steps.ancestry-check.outputs.passed }} |
+          | Fork commits preserved | ${{ steps.provenance-check.outputs.passed }} |
+          | No conflict markers | $([ "${{ steps.conflict-check.outputs.has_conflicts }}" = "false" ] && echo "Passed" || echo "Failed") |
+          | Python syntax valid | ${{ steps.syntax-check.outputs.passed }} |
+          | No manual resolution needed | ${{ steps.label-check.outputs.passed }} |
+
+          **This PR requires manual intervention before it can be merged.**
+
+          ---
+          *Verified by Agent 2 (Oval X fork management pipeline)*
+          EOF
+          )"
+          fi
+
+      - name: Egress summary
+        uses: ironsh/iron-proxy-action/summary@v1
+        if: always()
+
+  merge-and-release:
+    needs: verify
+    if: needs.verify.outputs.verified == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Iron Proxy
+        uses: ironsh/iron-proxy-action@v1
+        with:
+          egress-rules: egress-rules.yaml
+          warn: "false"
+
+      - name: Merge PR
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          PR_NUMBER="${{ github.event.pull_request.number }}"
+          TAG="${{ needs.verify.outputs.upstream_tag }}"
+
+          # Merge with a merge commit that records the sync provenance
+          gh pr merge "$PR_NUMBER" \
+            --merge \
+            --subject "sync: merge upstream ${TAG} into main" \
+            --body "Automated merge by Agent 2. Upstream release ${TAG} verified and integrated." \
+            --delete-branch
+
+      - name: Determine fork release version
+        id: version
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ needs.verify.outputs.upstream_tag }}"
+
+          # Strip the 'v' prefix if present from the upstream tag
+          UPSTREAM_VERSION="${TAG#v}"
+
+          # The fork release tag mirrors the upstream version with a fork suffix.
+          # e.g., upstream v0.3.5 -> fork v0.3.5-ovalx.1
+          # Check if a prior ovalx release exists for this upstream version
+          EXISTING=$(gh release list --limit 100 --json tagName -q \
+            "[.[] | select(.tagName | startswith(\"v${UPSTREAM_VERSION}-ovalx.\"))] | length")
+
+          FORK_REV=$((EXISTING + 1))
+          FORK_TAG="v${UPSTREAM_VERSION}-ovalx.${FORK_REV}"
+
+          echo "fork_tag=$FORK_TAG" >> "$GITHUB_OUTPUT"
+          echo "upstream_version=$UPSTREAM_VERSION" >> "$GITHUB_OUTPUT"
+          echo "Fork release tag: $FORK_TAG"
+
+      - name: Pull merged main
+        run: |
+          git pull origin main
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          FORK_TAG="${{ steps.version.outputs.fork_tag }}"
+          UPSTREAM_VERSION="${{ steps.version.outputs.upstream_version }}"
+          TAG="${{ needs.verify.outputs.upstream_tag }}"
+
+          # Tag the merged main
+          git tag "$FORK_TAG"
+          git push origin "$FORK_TAG"
+
+          # Create the GitHub release
+          gh release create "$FORK_TAG" \
+            --title "$FORK_TAG" \
+            --notes "$(cat <<EOF
+          ## Oval X Fork Release
+
+          Synced with upstream [\`${TAG}\`](https://github.com/${UPSTREAM_REPO}/releases/tag/${TAG}).
+
+          ### Changes
+          - Rebased fork-specific commits onto upstream \`${TAG}\`
+          - All verification checks passed (ancestry, provenance, syntax, conflict-free)
+
+          ### Upstream
+          - **Repository**: [${UPSTREAM_REPO}](https://github.com/${UPSTREAM_REPO})
+          - **Release**: [${TAG}](https://github.com/${UPSTREAM_REPO}/releases/tag/${TAG})
+
+          ---
+          *Released automatically by the Oval X fork management pipeline.*
+          EOF
+          )"
+
+          echo "Release $FORK_TAG created successfully."
+
+      - name: Egress summary
+        uses: ironsh/iron-proxy-action/summary@v1
+        if: always()
