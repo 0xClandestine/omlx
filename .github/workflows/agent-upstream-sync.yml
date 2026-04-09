@@ -1,12 +1,15 @@
 # Agent 1: Upstream Sync
 #
 # Autonomously monitors the upstream repository (jundot/omlx) for new releases.
-# When a new release is detected, it rebases the fork-specific commits on top of
-# the upstream release tag and opens a PR for Agent 2 to verify.
+# When a new release is detected, it merges the upstream tag into the fork branch,
+# preserving both commit lineages in the DAG.
 #
-# Commit provenance is preserved: the rebase maintains the original fork commit
-# hashes in the PR body so reviewers can trace exactly where fork-specific changes
-# land relative to the upstream commit chain.
+# Merge-based strategy: upstream's commit chain becomes a structural ancestor of
+# the fork branch. `git log --first-parent` shows sync points. `git log --graph`
+# shows both lineages. Fork commits retain their original SHAs.
+#
+# On merge conflict, invokes an LLM (via OpenRouter) to attempt automatic
+# resolution. Falls back to needs-manual-resolution if unresolvable.
 
 name: "Agent 1: Upstream Sync"
 
@@ -34,7 +37,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ env.FORK_BRANCH }}
-          # Full history is required for rebase operations
+          # Full history required for merge operations
           fetch-depth: 0
           token: ${{ secrets.GITHUB_TOKEN }}
 
@@ -59,7 +62,6 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # Get the latest release tag from upstream via GitHub API
           LATEST_TAG=$(gh release view --repo "$UPSTREAM_REPO" --json tagName -q '.tagName')
           if [ -z "$LATEST_TAG" ]; then
             echo "::error::Could not determine latest upstream release tag"
@@ -68,7 +70,6 @@ jobs:
           echo "latest_tag=$LATEST_TAG" >> "$GITHUB_OUTPUT"
           echo "Detected latest upstream release: $LATEST_TAG"
 
-          # Determine the sync branch name for this release
           SYNC_BRANCH="${SYNC_BRANCH_PREFIX}${LATEST_TAG}"
           echo "sync_branch=$SYNC_BRANCH" >> "$GITHUB_OUTPUT"
 
@@ -80,8 +81,7 @@ jobs:
           LATEST_TAG="${{ steps.detect.outputs.latest_tag }}"
           SYNC_BRANCH="${{ steps.detect.outputs.sync_branch }}"
 
-          # Check if this tag's commit is already an ancestor of our main branch.
-          # If it is, we are already up to date with this release.
+          # Resolve the upstream tag to a commit SHA
           UPSTREAM_TAG_SHA=$(git rev-parse "refs/tags/${LATEST_TAG}" 2>/dev/null || echo "")
           if [ -z "$UPSTREAM_TAG_SHA" ]; then
             echo "::error::Tag $LATEST_TAG not found after fetch"
@@ -89,6 +89,8 @@ jobs:
           fi
           echo "upstream_tag_sha=$UPSTREAM_TAG_SHA" >> "$GITHUB_OUTPUT"
 
+          # Check if the upstream tag is already an ancestor of our main branch.
+          # With merge-based sync, this means the tag was already merged in.
           if git merge-base --is-ancestor "$UPSTREAM_TAG_SHA" HEAD; then
             echo "Already synced with upstream $LATEST_TAG"
             echo "needs_sync=false" >> "$GITHUB_OUTPUT"
@@ -105,196 +107,194 @@ jobs:
 
           echo "needs_sync=true" >> "$GITHUB_OUTPUT"
 
-      - name: Identify fork-specific commits
+      - name: Record pre-merge fork state
         if: steps.check.outputs.needs_sync == 'true'
-        id: fork-commits
+        id: fork-state
         run: |
           LATEST_TAG="${{ steps.detect.outputs.latest_tag }}"
+          UPSTREAM_TAG_SHA="${{ steps.check.outputs.upstream_tag_sha }}"
 
-          # Find the merge base between our fork's main and the upstream tag.
-          # All commits on our side after this point are fork-specific.
-          MERGE_BASE=$(git merge-base HEAD "$UPSTREAM_REMOTE/$FORK_BRANCH" 2>/dev/null || \
-                       git merge-base HEAD "refs/tags/${LATEST_TAG}" 2>/dev/null || echo "")
+          # Record the current fork HEAD before merge
+          FORK_HEAD=$(git rev-parse HEAD)
+          echo "fork_head=$FORK_HEAD" >> "$GITHUB_OUTPUT"
 
+          # Find the merge base — this is where the fork and upstream last shared history
+          MERGE_BASE=$(git merge-base HEAD "$UPSTREAM_TAG_SHA" 2>/dev/null || echo "")
           if [ -z "$MERGE_BASE" ]; then
-            # Fallback: find the newest tag that IS an ancestor of HEAD
-            # This handles the case where upstream/main doesn't exist
-            MERGE_BASE=$(git merge-base HEAD "refs/tags/${LATEST_TAG}^" 2>/dev/null || echo "")
-          fi
-
-          if [ -z "$MERGE_BASE" ]; then
-            echo "::warning::Could not find merge base. Assuming all commits are fork-specific."
-            # Use the root commit as the base
             MERGE_BASE=$(git rev-list --max-parents=0 HEAD | tail -1)
           fi
-
           echo "merge_base=$MERGE_BASE" >> "$GITHUB_OUTPUT"
+          echo "Merge base: $MERGE_BASE"
 
-          # Record the fork-specific commits for the PR body (preserves provenance)
-          FORK_COMMITS=$(git log --oneline "${MERGE_BASE}..HEAD" 2>/dev/null || echo "(none)")
-          echo "fork_commit_count=$(echo "$FORK_COMMITS" | grep -c '.' || echo 0)" >> "$GITHUB_OUTPUT"
-
-          # Store to file for the PR body (multi-line output)
+          # Record fork-specific commits (commits on our side since the merge base)
+          FORK_COMMITS=$(git log --oneline --first-parent "${MERGE_BASE}..HEAD" 2>/dev/null || echo "(none)")
+          FORK_COUNT=$(echo "$FORK_COMMITS" | grep -c '.' 2>/dev/null || echo 0)
+          echo "fork_commit_count=$FORK_COUNT" >> "$GITHUB_OUTPUT"
           echo "$FORK_COMMITS" > /tmp/fork-commits.txt
-          echo "Fork-specific commits to rebase:"
-          cat /tmp/fork-commits.txt
 
-      - name: Rebase fork commits onto upstream release
+          # Record upstream commits being merged in
+          UPSTREAM_COMMITS=$(git log --oneline "${MERGE_BASE}..${UPSTREAM_TAG_SHA}" 2>/dev/null || echo "(none)")
+          UPSTREAM_COUNT=$(echo "$UPSTREAM_COMMITS" | grep -c '.' 2>/dev/null || echo 0)
+          echo "upstream_commit_count=$UPSTREAM_COUNT" >> "$GITHUB_OUTPUT"
+          echo "$UPSTREAM_COMMITS" > /tmp/upstream-commits.txt
+
+          echo "Fork-specific commits ($FORK_COUNT):"
+          cat /tmp/fork-commits.txt
+          echo ""
+          echo "Upstream commits to merge ($UPSTREAM_COUNT):"
+          cat /tmp/upstream-commits.txt
+
+      - name: Merge upstream into fork
         if: steps.check.outputs.needs_sync == 'true'
-        id: rebase
+        id: merge
         env:
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
         run: |
           LATEST_TAG="${{ steps.detect.outputs.latest_tag }}"
           SYNC_BRANCH="${{ steps.detect.outputs.sync_branch }}"
-          MERGE_BASE="${{ steps.fork-commits.outputs.merge_base }}"
+          UPSTREAM_TAG_SHA="${{ steps.check.outputs.upstream_tag_sha }}"
 
-          # Create the sync branch starting from the upstream release tag
-          git checkout -b "$SYNC_BRANCH" "refs/tags/${LATEST_TAG}"
+          # Create the sync branch from the current fork main
+          git checkout -b "$SYNC_BRANCH"
 
-          # If there are fork-specific commits, replay them on top
-          FORK_COUNT="${{ steps.fork-commits.outputs.fork_commit_count }}"
-          if [ "$FORK_COUNT" -gt 0 ] && [ "$MERGE_BASE" != "$(git rev-parse HEAD)" ]; then
-            echo "Rebasing $FORK_COUNT fork-specific commit(s) onto $LATEST_TAG..."
+          # Merge the upstream tag into the fork branch.
+          # --no-ff ensures a merge commit is always created, making sync points
+          # visible in `git log --first-parent`.
+          # The fork branch is the first parent, upstream is the second parent.
+          LLM_RESOLUTIONS=0
 
-            # Collect commit list first to avoid subshell issues with pipes
-            COMMIT_LIST=$(git rev-list --reverse "${MERGE_BASE}..origin/${FORK_BRANCH}" --no-merges)
+          if git merge "refs/tags/${LATEST_TAG}" --no-ff \
+               -m "sync: merge upstream ${LATEST_TAG}" \
+               -m "Upstream release ${LATEST_TAG} merged into fork." \
+               -m "Upstream tag: ${UPSTREAM_TAG_SHA}"; then
+            echo "Merge completed cleanly"
+          else
+            echo "::warning::Merge conflicts detected. Attempting LLM resolution..."
 
-            # Cherry-pick each fork commit to preserve authorship and message.
-            # On conflict, invoke LLM to attempt automatic resolution.
-            LLM_RESOLUTIONS=0
-            for COMMIT_SHA in $COMMIT_LIST; do
-              COMMIT_MSG=$(git log -1 --format='%s' "$COMMIT_SHA")
-              echo "Cherry-picking $COMMIT_SHA: $COMMIT_MSG"
-              if git cherry-pick "$COMMIT_SHA" --allow-empty; then
-                continue
-              fi
+            # Collect all conflicting files
+            CONFLICTED_FILES=$(git diff --name-only --diff-filter=U)
+            if [ -z "$CONFLICTED_FILES" ]; then
+              echo "::error::Merge failed but no conflicted files found. Aborting."
+              git merge --abort
+              echo "conflict=true" >> "$GITHUB_OUTPUT"
+              echo "conflict_details=Merge failed with no identifiable conflicts" >> "$GITHUB_OUTPUT"
+              echo "rebase_head=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+              echo "llm_resolutions=0" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
 
-              echo "::warning::Conflict cherry-picking $COMMIT_SHA. Invoking LLM for resolution..."
+            TOTAL_CONFLICTS=$(echo "$CONFLICTED_FILES" | wc -l | tr -d ' ')
+            echo "Found $TOTAL_CONFLICTS conflicting file(s)"
 
-              # Collect all conflicting files
-              CONFLICTED_FILES=$(git diff --name-only --diff-filter=U)
-              if [ -z "$CONFLICTED_FILES" ]; then
-                echo "No conflicted files found (unexpected). Aborting."
-                git cherry-pick --abort
-                echo "conflict=true" >> "$GITHUB_OUTPUT"
-                echo "conflict_commit=$COMMIT_SHA" >> "$GITHUB_OUTPUT"
-                echo "conflict_message=$COMMIT_MSG" >> "$GITHUB_OUTPUT"
+            RESOLUTION_FAILED=false
+            for FILE in $CONFLICTED_FILES; do
+              echo "  Resolving conflict in: $FILE"
+
+              CONFLICT_CONTENT=$(cat "$FILE")
+
+              # Get the fork's version of the file (ours)
+              OURS_CONTENT=$(git show ":2:$FILE" 2>/dev/null || echo "(file added)")
+              # Get the upstream's version (theirs)
+              THEIRS_CONTENT=$(git show ":3:$FILE" 2>/dev/null || echo "(file added)")
+              # Recent upstream log for this file
+              UPSTREAM_LOG=$(git log --oneline -10 "refs/tags/${LATEST_TAG}" -- "$FILE" 2>/dev/null || echo "(none)")
+              # Recent fork log for this file
+              FORK_LOG=$(git log --oneline -10 HEAD -- "$FILE" 2>/dev/null || echo "(none)")
+
+              RESPONSE=$(curl -s -w "\n%{http_code}" "https://openrouter.ai/api/v1/chat/completions" \
+                -H "Authorization: Bearer $OPENROUTER_API_KEY" \
+                -H "Content-Type: application/json" \
+                -H "HTTP-Referer: https://github.com/0xClandestine/omlx" \
+                -H "X-Title: Oval X Fork Sync Agent" \
+                -d "$(jq -n \
+                  --arg file "$FILE" \
+                  --arg conflict "$CONFLICT_CONTENT" \
+                  --arg ours "$OURS_CONTENT" \
+                  --arg theirs "$THEIRS_CONTENT" \
+                  --arg upstream_log "$UPSTREAM_LOG" \
+                  --arg fork_log "$FORK_LOG" \
+                  '{
+                    model: "anthropic/claude-sonnet-4",
+                    max_tokens: 16384,
+                    messages: [{
+                      role: "system",
+                      content: "You are a git merge conflict resolver for a fork management system. You receive a file with git conflict markers from a merge of an upstream release into a downstream fork. Both sets of changes should be preserved where possible. The fork-specific modifications take precedence when there is a genuine semantic conflict. Return ONLY the resolved file content with no conflict markers, no markdown fencing, no commentary."
+                    }, {
+                      role: "user",
+                      content: ("Resolve this merge conflict.\n\nFile: " + $file + "\n\nRecent upstream commits touching this file:\n" + $upstream_log + "\n\nRecent fork commits touching this file:\n" + $fork_log + "\n\nFork version (ours):\n" + $ours + "\n\nUpstream version (theirs):\n" + $theirs + "\n\nFile with conflict markers:\n" + $conflict)
+                    }]
+                  }')" 2>/dev/null)
+
+              HTTP_CODE=$(echo "$RESPONSE" | tail -1)
+              BODY=$(echo "$RESPONSE" | sed '$d')
+
+              if [ "$HTTP_CODE" != "200" ]; then
+                echo "  LLM API returned HTTP $HTTP_CODE for $FILE. Aborting resolution."
+                RESOLUTION_FAILED=true
                 break
               fi
 
-              # Attempt LLM resolution for each conflicted file
-              RESOLUTION_FAILED=false
-              for FILE in $CONFLICTED_FILES; do
-                echo "  Resolving conflict in: $FILE"
-
-                # Build context for the LLM
-                CONFLICT_CONTENT=$(cat "$FILE")
-                FORK_PATCH=$(git log -1 -p "$COMMIT_SHA" -- "$FILE" 2>/dev/null || echo "(new file)")
-                UPSTREAM_CONTEXT=$(git log --oneline -5 "refs/tags/${LATEST_TAG}" -- "$FILE" 2>/dev/null || echo "(no recent changes)")
-
-                # Call OpenRouter API
-                RESPONSE=$(curl -s -w "\n%{http_code}" "https://openrouter.ai/api/v1/chat/completions" \
-                  -H "Authorization: Bearer $OPENROUTER_API_KEY" \
-                  -H "Content-Type: application/json" \
-                  -H "HTTP-Referer: https://github.com/0xClandestine/omlx" \
-                  -H "X-Title: Oval X Fork Sync Agent" \
-                  -d "$(jq -n \
-                    --arg file "$FILE" \
-                    --arg conflict "$CONFLICT_CONTENT" \
-                    --arg patch "$FORK_PATCH" \
-                    --arg upstream "$UPSTREAM_CONTEXT" \
-                    --arg commit_msg "$COMMIT_MSG" \
-                    '{
-                      model: "anthropic/claude-sonnet-4",
-                      max_tokens: 16384,
-                      messages: [{
-                        role: "system",
-                        content: "You are a git merge conflict resolver for a fork management system. You receive a file with git conflict markers and must produce the resolved file content. The fork-specific changes should be preserved while integrating cleanly with upstream changes. Return ONLY the resolved file content with no conflict markers, no markdown fencing, no commentary."
-                      }, {
-                        role: "user",
-                        content: ("Resolve this merge conflict.\n\nFile: " + $file + "\nFork commit: " + $commit_msg + "\n\nRecent upstream changes to this file:\n" + $upstream + "\n\nFork patch being applied:\n" + $patch + "\n\nFile with conflict markers:\n" + $conflict)
-                      }]
-                    }')" 2>/dev/null)
-
-                HTTP_CODE=$(echo "$RESPONSE" | tail -1)
-                BODY=$(echo "$RESPONSE" | sed '$d')
-
-                if [ "$HTTP_CODE" != "200" ]; then
-                  echo "  LLM API returned HTTP $HTTP_CODE for $FILE. Aborting resolution."
-                  RESOLUTION_FAILED=true
-                  break
-                fi
-
-                # Extract the resolved content from the response
-                RESOLVED=$(echo "$BODY" | jq -r '.choices[0].message.content // empty')
-                if [ -z "$RESOLVED" ]; then
-                  echo "  LLM returned empty resolution for $FILE. Aborting."
-                  RESOLUTION_FAILED=true
-                  break
-                fi
-
-                # Verify the resolution contains no conflict markers
-                if echo "$RESOLVED" | grep -q '^<<<<<<< \|^=======$\|^>>>>>>> '; then
-                  echo "  LLM resolution still contains conflict markers. Aborting."
-                  RESOLUTION_FAILED=true
-                  break
-                fi
-
-                # Apply the resolution
-                echo "$RESOLVED" > "$FILE"
-                git add "$FILE"
-                echo "  Resolved $FILE via LLM"
-              done
-
-              if [ "$RESOLUTION_FAILED" = true ]; then
-                git cherry-pick --abort
-                echo "conflict=true" >> "$GITHUB_OUTPUT"
-                echo "conflict_commit=$COMMIT_SHA" >> "$GITHUB_OUTPUT"
-                echo "conflict_message=$COMMIT_MSG" >> "$GITHUB_OUTPUT"
+              RESOLVED=$(echo "$BODY" | jq -r '.choices[0].message.content // empty')
+              if [ -z "$RESOLVED" ]; then
+                echo "  LLM returned empty resolution for $FILE. Aborting."
+                RESOLUTION_FAILED=true
                 break
               fi
 
-              # Commit the LLM-resolved cherry-pick
-              git cherry-pick --continue --no-edit || git commit --no-edit --allow-empty
+              if echo "$RESOLVED" | grep -q '^<<<<<<< \|^=======$\|^>>>>>>> '; then
+                echo "  LLM resolution still contains conflict markers. Aborting."
+                RESOLUTION_FAILED=true
+                break
+              fi
+
+              echo "$RESOLVED" > "$FILE"
+              git add "$FILE"
               LLM_RESOLUTIONS=$((LLM_RESOLUTIONS + 1))
-              echo "  Cherry-pick completed with LLM-assisted resolution"
+              echo "  Resolved $FILE via LLM ($LLM_RESOLUTIONS/$TOTAL_CONFLICTS)"
             done
 
-            echo "llm_resolutions=$LLM_RESOLUTIONS" >> "$GITHUB_OUTPUT"
-            if [ "$LLM_RESOLUTIONS" -gt 0 ]; then
-              echo "::notice::$LLM_RESOLUTIONS conflict(s) resolved via LLM"
+            if [ "$RESOLUTION_FAILED" = true ]; then
+              git merge --abort
+              echo "conflict=true" >> "$GITHUB_OUTPUT"
+              echo "conflict_details=LLM could not resolve all conflicts. $LLM_RESOLUTIONS/$TOTAL_CONFLICTS resolved before failure." >> "$GITHUB_OUTPUT"
+              echo "rebase_head=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+              echo "llm_resolutions=$LLM_RESOLUTIONS" >> "$GITHUB_OUTPUT"
+              exit 0
             fi
-          else
-            echo "No fork-specific commits to rebase. Sync branch is a clean upstream tag."
+
+            # All conflicts resolved — complete the merge
+            git commit --no-edit
+            echo "Merge completed with $LLM_RESOLUTIONS LLM-resolved conflict(s)"
           fi
 
+          echo "llm_resolutions=$LLM_RESOLUTIONS" >> "$GITHUB_OUTPUT"
           echo "rebase_head=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          if [ "$LLM_RESOLUTIONS" -gt 0 ]; then
+            echo "::notice::$LLM_RESOLUTIONS conflict(s) resolved via LLM"
+          fi
 
       - name: Update fork.yaml hash pins
-        if: steps.check.outputs.needs_sync == 'true'
+        if: steps.check.outputs.needs_sync == 'true' && steps.merge.outputs.conflict != 'true'
         run: |
           UPSTREAM_TAG_SHA="${{ steps.check.outputs.upstream_tag_sha }}"
-          REBASE_HEAD=$(git rev-parse HEAD)
+          MERGE_HEAD=$(git rev-parse HEAD)
 
-          # Update the base hash (upstream pin) in fork.yaml
           sed -i "s/^  hash: .* # upstream-pin/  hash: ${UPSTREAM_TAG_SHA} # upstream-pin/" fork.yaml
-          # Update the fork hash (downstream pin) in fork.yaml
-          sed -i "s/^  hash: .* # fork-pin/  hash: ${REBASE_HEAD} # fork-pin/" fork.yaml
+          sed -i "s/^  hash: .* # fork-pin/  hash: ${MERGE_HEAD} # fork-pin/" fork.yaml
 
           if git diff --quiet fork.yaml; then
             echo "fork.yaml already up to date"
           else
             git add fork.yaml
             git commit -m "fork: update hash pins for ${{ steps.detect.outputs.latest_tag }}"
-            echo "Updated fork.yaml: base=$UPSTREAM_TAG_SHA fork=$REBASE_HEAD"
+            echo "Updated fork.yaml: base=$UPSTREAM_TAG_SHA fork=$MERGE_HEAD"
           fi
 
       - name: Push sync branch
-        if: steps.check.outputs.needs_sync == 'true'
+        if: steps.check.outputs.needs_sync == 'true' && steps.merge.outputs.conflict != 'true'
         run: |
           SYNC_BRANCH="${{ steps.detect.outputs.sync_branch }}"
-          git push origin "$SYNC_BRANCH" --force-with-lease
+          git push origin "$SYNC_BRANCH"
 
       - name: Open pull request
         if: steps.check.outputs.needs_sync == 'true'
@@ -304,30 +304,56 @@ jobs:
           LATEST_TAG="${{ steps.detect.outputs.latest_tag }}"
           SYNC_BRANCH="${{ steps.detect.outputs.sync_branch }}"
           UPSTREAM_TAG_SHA="${{ steps.check.outputs.upstream_tag_sha }}"
-          MERGE_BASE="${{ steps.fork-commits.outputs.merge_base }}"
-          FORK_COUNT="${{ steps.fork-commits.outputs.fork_commit_count }}"
-          CONFLICT="${{ steps.rebase.outputs.conflict }}"
-          CONFLICT_COMMIT="${{ steps.rebase.outputs.conflict_commit }}"
-          CONFLICT_MSG="${{ steps.rebase.outputs.conflict_message }}"
-          REBASE_HEAD="${{ steps.rebase.outputs.rebase_head }}"
-          LLM_RESOLUTIONS="${{ steps.rebase.outputs.llm_resolutions }}"
+          MERGE_BASE="${{ steps.fork-state.outputs.merge_base }}"
+          FORK_HEAD="${{ steps.fork-state.outputs.fork_head }}"
+          FORK_COUNT="${{ steps.fork-state.outputs.fork_commit_count }}"
+          UPSTREAM_COUNT="${{ steps.fork-state.outputs.upstream_commit_count }}"
+          CONFLICT="${{ steps.merge.outputs.conflict }}"
+          CONFLICT_DETAILS="${{ steps.merge.outputs.conflict_details }}"
+          MERGE_HEAD="${{ steps.merge.outputs.rebase_head }}"
+          LLM_RESOLUTIONS="${{ steps.merge.outputs.llm_resolutions }}"
           FORK_COMMITS=$(cat /tmp/fork-commits.txt 2>/dev/null || echo "(none)")
+          UPSTREAM_COMMITS=$(cat /tmp/upstream-commits.txt 2>/dev/null || echo "(none)")
 
-          # Build conflict warning section if applicable
-          CONFLICT_SECTION=""
+          # If merge failed entirely, don't open a PR
           if [ "$CONFLICT" = "true" ]; then
-            CONFLICT_SECTION=$(cat <<INNER
-          > **Warning**: Rebase encountered an unresolvable conflict at commit \`${CONFLICT_COMMIT}\` ("${CONFLICT_MSG}").
-          > The LLM was unable to resolve this conflict. Manual resolution is required.
-          INNER
-          )
+            echo "::error::Merge failed. Creating issue instead of PR."
+            gh issue create \
+              --title "sync: merge conflict for upstream ${LATEST_TAG}" \
+              --label "upstream-sync,needs-manual-resolution" \
+              --body "$(cat <<EOF
+          ## Upstream Sync Failed: ${LATEST_TAG}
+
+          Agent 1 was unable to merge upstream [\`${LATEST_TAG}\`](https://github.com/${UPSTREAM_REPO}/releases/tag/${LATEST_TAG}).
+
+          **Reason**: ${CONFLICT_DETAILS}
+
+          ### Context
+          - Upstream tag: \`${UPSTREAM_TAG_SHA}\`
+          - Fork HEAD at time of attempt: \`${FORK_HEAD}\`
+          - LLM resolutions attempted: ${LLM_RESOLUTIONS:-0}
+
+          ### Manual steps
+          \`\`\`bash
+          git fetch upstream --tags
+          git checkout -b sync/upstream-${LATEST_TAG} main
+          git merge refs/tags/${LATEST_TAG} --no-ff
+          # resolve conflicts manually
+          git push origin sync/upstream-${LATEST_TAG}
+          \`\`\`
+
+          ---
+          *Created by Agent 1 (Oval X fork management pipeline)*
+          EOF
+          )"
+            exit 0
           fi
 
-          # Build LLM resolution notice if applicable
+          # Build LLM notice
           LLM_SECTION=""
           if [ "${LLM_RESOLUTIONS:-0}" -gt 0 ]; then
             LLM_SECTION=$(cat <<INNER
-          > **Note**: ${LLM_RESOLUTIONS} conflict(s) were automatically resolved via LLM (OpenRouter).
+          > **Note**: ${LLM_RESOLUTIONS} merge conflict(s) were automatically resolved via LLM (OpenRouter).
           > Agent 2 will perform semantic verification of these resolutions.
           INNER
           )
@@ -335,9 +361,6 @@ jobs:
 
           # Build labels
           LABELS="upstream-sync,automated"
-          if [ "$CONFLICT" = "true" ]; then
-            LABELS="${LABELS},needs-manual-resolution"
-          fi
           if [ "${LLM_RESOLUTIONS:-0}" -gt 0 ]; then
             LABELS="${LABELS},llm-resolved"
           fi
@@ -345,35 +368,47 @@ jobs:
           gh pr create \
             --base "$FORK_BRANCH" \
             --head "$SYNC_BRANCH" \
-            --title "sync: rebase onto upstream ${LATEST_TAG}" \
+            --title "sync: merge upstream ${LATEST_TAG}" \
             --label "$LABELS" \
             --body "$(cat <<EOF
           ## Upstream Sync: ${LATEST_TAG}
 
           This PR was automatically generated by **Agent 1 (Upstream Sync)**.
 
+          ### Strategy
+          **Merge-based sync**: upstream is merged into the fork branch, preserving both
+          commit lineages in the DAG. Fork commits retain their original SHAs.
+
+          - \`git log --first-parent\` shows sync points
+          - \`git log --graph\` shows both upstream and fork lineages
+          - Upstream's full commit chain is a structural ancestor of this branch
+
           ### What happened
           - Detected new upstream release: [\`${LATEST_TAG}\`](https://github.com/${UPSTREAM_REPO}/releases/tag/${LATEST_TAG})
           - Upstream tag commit: \`${UPSTREAM_TAG_SHA}\`
-          - Fork-specific commits were cherry-picked on top of the upstream tag to preserve provenance.
+          - Merged ${UPSTREAM_COUNT} upstream commit(s) into fork
           - LLM-assisted conflict resolutions: **${LLM_RESOLUTIONS:-0}**
 
-          ${CONFLICT_SECTION}
           ${LLM_SECTION}
 
-          ### Fork commit provenance
+          ### Commit graph
 
-          The following fork-specific commits (${FORK_COUNT}) were rebased onto \`${LATEST_TAG}\`:
-
+          **Fork-specific commits** (${FORK_COUNT}, preserved with original SHAs):
           \`\`\`
           ${FORK_COMMITS}
           \`\`\`
 
-          - **Merge base (divergence point)**: \`${MERGE_BASE}\`
-          - **New HEAD after rebase**: \`${REBASE_HEAD}\`
+          **Upstream commits being merged** (${UPSTREAM_COUNT}):
+          \`\`\`
+          ${UPSTREAM_COMMITS}
+          \`\`\`
+
+          - **Last common ancestor**: \`${MERGE_BASE}\`
+          - **Fork HEAD (pre-merge)**: \`${FORK_HEAD}\`
+          - **Merge HEAD**: \`${MERGE_HEAD}\`
 
           ### Next steps
-          **Agent 2 (Verification)** will automatically validate this PR. This includes semantic analysis of the rebase diff and any LLM-resolved conflicts.
+          **Agent 2 (Verification)** will automatically validate this merge and, if correct, merge to \`main\` and cut a release.
 
           ---
           *This PR is managed by the Oval X autonomous fork sync pipeline.*

@@ -60,7 +60,7 @@ jobs:
           git remote add upstream "https://github.com/${UPSTREAM_REPO}.git" 2>/dev/null || true
           git fetch upstream --tags
 
-      - name: "Check 1: Upstream tag is ancestor"
+      - name: "Check 1: Upstream tag is ancestor (merge integrity)"
         id: ancestry-check
         run: |
           TAG="${{ steps.extract-tag.outputs.tag }}"
@@ -72,57 +72,73 @@ jobs:
             exit 0
           fi
 
+          # In the merge-based strategy, the upstream tag must be an ancestor
+          # of the sync branch HEAD (it was merged in as the second parent).
           if git merge-base --is-ancestor "$TAG_SHA" HEAD; then
             echo "Upstream tag $TAG ($TAG_SHA) is an ancestor of sync branch HEAD"
             echo "passed=true" >> "$GITHUB_OUTPUT"
           else
-            echo "::error::Upstream tag $TAG is NOT an ancestor of sync branch HEAD. Rebase integrity broken."
+            echo "::error::Upstream tag $TAG is NOT an ancestor. Merge integrity broken."
             echo "passed=false" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: "Check 2: Fork commits preserved"
+          # Additionally verify the merge commit structure: HEAD should be a merge
+          # commit with the upstream tag reachable via the second parent.
+          PARENT_COUNT=$(git cat-file -p HEAD | grep -c '^parent ')
+          if [ "$PARENT_COUNT" -lt 2 ]; then
+            # HEAD might be the fork.yaml pin update commit; check its parent
+            MERGE_COMMIT=$(git log --merges --format='%H' -1 HEAD)
+            if [ -n "$MERGE_COMMIT" ]; then
+              SECOND_PARENT=$(git rev-parse "${MERGE_COMMIT}^2" 2>/dev/null || echo "")
+              if [ -n "$SECOND_PARENT" ] && git merge-base --is-ancestor "$TAG_SHA" "$SECOND_PARENT"; then
+                echo "Merge commit $MERGE_COMMIT has upstream as second parent lineage"
+              else
+                echo "::warning::Could not verify second-parent lineage (non-critical)"
+              fi
+            fi
+          fi
+
+      - name: "Check 2: Fork commits preserved (SHA-level)"
         id: provenance-check
         run: |
-          # Verify that the PR body lists fork commits and they are present in the branch.
-          # We check that every non-merge commit from origin/main that isn't in the upstream
-          # tag has a corresponding cherry-pick on this branch (by commit message matching).
+          # With merge-based sync, fork commits keep their original SHAs.
+          # Verify that every commit from origin/main is reachable from HEAD.
           TAG="${{ steps.extract-tag.outputs.tag }}"
-
-          # Get the merge base between the upstream tag and origin/main
           git fetch origin main
-          MERGE_BASE=$(git merge-base "refs/tags/${TAG}" origin/main 2>/dev/null || echo "")
 
+          MERGE_BASE=$(git merge-base "refs/tags/${TAG}" origin/main 2>/dev/null || echo "")
           if [ -z "$MERGE_BASE" ]; then
-            echo "::warning::Could not determine merge base for provenance check. Skipping."
+            echo "::warning::Could not determine merge base. Skipping provenance check."
             echo "passed=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
-          # Get fork-specific commit messages from origin/main
-          FORK_MSGS=$(git log --oneline --no-merges "${MERGE_BASE}..origin/main" --format='%s' | sort)
-          # Get commit messages on the sync branch after the upstream tag
-          SYNC_MSGS=$(git log --oneline --no-merges "refs/tags/${TAG}..HEAD" --format='%s' | sort)
-
-          if [ -z "$FORK_MSGS" ]; then
+          # Get fork-specific commit SHAs from origin/main
+          FORK_SHAS=$(git rev-list "${MERGE_BASE}..origin/main" --no-merges)
+          if [ -z "$FORK_SHAS" ]; then
             echo "No fork-specific commits to verify (clean upstream sync)"
             echo "passed=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
-          # Check each fork commit message appears in the sync branch
+          # Each fork commit SHA should be reachable from HEAD (since merge
+          # preserves the fork's first-parent lineage with original SHAs).
           MISSING=0
-          while IFS= read -r MSG; do
-            if ! echo "$SYNC_MSGS" | grep -qF "$MSG"; then
-              echo "::warning::Fork commit not found in sync branch: $MSG"
+          for SHA in $FORK_SHAS; do
+            if git merge-base --is-ancestor "$SHA" HEAD 2>/dev/null; then
+              continue
+            else
+              echo "::warning::Fork commit $SHA not reachable from sync branch HEAD"
               MISSING=$((MISSING + 1))
             fi
-          done <<< "$FORK_MSGS"
+          done
 
+          TOTAL=$(echo "$FORK_SHAS" | wc -l | tr -d ' ')
           if [ "$MISSING" -gt 0 ]; then
-            echo "::error::$MISSING fork-specific commit(s) missing from sync branch"
+            echo "::error::$MISSING/$TOTAL fork commit(s) not reachable from sync branch"
             echo "passed=false" >> "$GITHUB_OUTPUT"
           else
-            echo "All fork-specific commits preserved in sync branch"
+            echo "All $TOTAL fork commits preserved with original SHAs"
             echo "passed=true" >> "$GITHUB_OUTPUT"
           fi
 

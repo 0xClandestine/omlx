@@ -30,20 +30,19 @@ def:
         - title: "Agent 1: Upstream Sync"
           description: |
             Polls `jundot/omlx` for new releases on a 6-hour cron. When a new release is
-            detected, cherry-picks fork-specific commits onto the upstream tag preserving
-            full commit provenance. On conflict, invokes an LLM (via OpenRouter) to
-            attempt automatic resolution. Opens a PR for Agent 2 with provenance and
-            resolution metadata.
+            detected, merges the upstream tag into the fork branch preserving both commit
+            lineages in the DAG. Fork commits retain their original SHAs. On conflict,
+            invokes an LLM (via OpenRouter) to attempt automatic resolution. Opens a PR
+            for Agent 2 with full commit graph provenance.
           globs:
             - ".github/workflows/agent-upstream-sync.yml"
 
         - title: "Agent 2: Verify & Release"
           description: |
-            Validates Agent 1's rebase work with both deterministic checks (ancestry,
-            provenance, conflict markers, Python syntax, labels) and agentic analysis
-            (LLM semantic verification of the rebase diff via OpenRouter). Pays extra
-            attention to LLM-resolved conflicts. On pass, merges to `main` and cuts a
-            versioned fork release.
+            Validates Agent 1's merge with both deterministic checks (upstream ancestry,
+            SHA-level fork commit preservation, conflict markers, Python syntax, labels)
+            and agentic analysis (LLM semantic verification of the merge diff via
+            OpenRouter). On pass, merges to `main` and cuts a versioned fork release.
           globs:
             - ".github/workflows/agent-verify-release.yml"
 
