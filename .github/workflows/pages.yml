@@ -1,0 +1,80 @@
+# Build and deploy fork diff summary to GitHub Pages using protolambda/forkdiff.
+# Runs on every push to main (sync merges, manual PRs, direct pushes) and on manual trigger.
+#
+# Before building, the fork.hash pin in fork.yaml is updated to the current HEAD
+# so the rendered diff always reflects the actual state of the fork.
+
+name: "Fork Diff Pages"
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+jobs:
+  build:
+    concurrency: ci-${{ github.ref }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Fetch upstream for diff
+        run: |
+          git remote add upstream https://github.com/jundot/omlx.git 2>/dev/null || true
+          git fetch upstream --tags
+
+      - name: Update fork.yaml hash pins
+        run: |
+          FORK_HEAD=$(git rev-parse HEAD)
+          CURRENT_FORK_HASH=$(grep '# fork-pin' fork.yaml | sed 's/.*hash: \([a-f0-9]*\).*/\1/')
+
+          if [ "$FORK_HEAD" = "$CURRENT_FORK_HASH" ]; then
+            echo "fork.hash already current ($FORK_HEAD)"
+          else
+            sed -i "s/^  hash: .* # fork-pin/  hash: ${FORK_HEAD} # fork-pin/" fork.yaml
+            git config user.name "oval-x-sync[bot]"
+            git config user.email "oval-x-sync[bot]@users.noreply.github.com"
+            git add fork.yaml
+            git commit -m "fork: update fork hash pin to $(echo $FORK_HEAD | cut -c1-12)"
+            git push origin main
+            echo "Updated fork.hash: $CURRENT_FORK_HASH -> $FORK_HEAD"
+          fi
+
+      - name: Build forkdiff
+        uses: "docker://protolambda/forkdiff:0.1.0"
+        with:
+          args: -repo=/github/workspace -fork=/github/workspace/fork.yaml -out=/github/workspace/index.html
+
+      - name: Setup Pages
+        uses: actions/configure-pages@v5
+
+      - name: Move index.html to _site
+        run: |
+          mkdir -p _site
+          mv index.html _site/
+
+      - name: Upload artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+  deploy:
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
