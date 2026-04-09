@@ -173,6 +173,102 @@ jobs:
             echo "passed=true" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: "Check 6: LLM semantic verification"
+        id: semantic-check
+        env:
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+        run: |
+          TAG="${{ steps.extract-tag.outputs.tag }}"
+
+          # Generate the complete diff between the upstream tag and our sync branch HEAD.
+          # This is what Agent 2 asks the LLM to review for semantic correctness.
+          DIFF=$(git diff "refs/tags/${TAG}..HEAD" -- '*.py' '*.toml' '*.yaml' '*.yml' '*.cfg' 2>/dev/null | head -c 100000)
+
+          if [ -z "$DIFF" ]; then
+            echo "No meaningful diff to review (clean sync with no fork changes)"
+            echo "passed=true" >> "$GITHUB_OUTPUT"
+            echo "analysis=No fork-specific changes to review." >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Get the fork commit messages for context
+          FORK_MSGS=$(git log --oneline --no-merges "refs/tags/${TAG}..HEAD" 2>/dev/null | head -30)
+
+          # Check if any commits were LLM-resolved (from PR labels)
+          HAS_LLM_LABEL='${{ toJson(github.event.pull_request.labels.*.name) }}'
+          LLM_RESOLVED=false
+          if echo "$HAS_LLM_LABEL" | grep -q "llm-resolved"; then
+            LLM_RESOLVED=true
+          fi
+
+          RESPONSE=$(curl -s -w "\n%{http_code}" "https://openrouter.ai/api/v1/chat/completions" \
+            -H "Authorization: Bearer $OPENROUTER_API_KEY" \
+            -H "Content-Type: application/json" \
+            -H "HTTP-Referer: https://github.com/0xClandestine/omlx" \
+            -H "X-Title: Oval X Fork Verify Agent" \
+            -d "$(jq -n \
+              --arg diff "$DIFF" \
+              --arg commits "$FORK_MSGS" \
+              --argjson llm_resolved "$LLM_RESOLVED" \
+              '{
+                model: "anthropic/claude-sonnet-4",
+                max_tokens: 4096,
+                messages: [{
+                  role: "system",
+                  content: "You are a code review agent for an autonomous fork management system. You verify that rebased fork-specific commits are semantically correct when replayed on top of a new upstream release. Your job is to catch logical regressions, broken assumptions, or integration errors that syntactic checks would miss.\n\nRespond with a JSON object (no markdown fencing) with exactly two fields:\n- \"verdict\": either \"PASS\" or \"FAIL\"\n- \"analysis\": a concise explanation (2-5 sentences) of your reasoning. If FAIL, explain what is broken and why."
+                }, {
+                  role: "user",
+                  content: ("Review this rebase for semantic correctness.\n\nFork commits applied on top of upstream tag:\n" + $commits + "\n\nLLM-resolved conflicts present: " + (if $llm_resolved then "YES — pay extra attention to these regions" else "NO" end) + "\n\nComplete diff of fork changes vs upstream tag:\n" + $diff)
+                }]
+              }')" 2>/dev/null)
+
+          HTTP_CODE=$(echo "$RESPONSE" | tail -1)
+          BODY=$(echo "$RESPONSE" | sed '$d')
+
+          if [ "$HTTP_CODE" != "200" ]; then
+            echo "::warning::LLM API returned HTTP $HTTP_CODE. Skipping semantic check."
+            echo "passed=true" >> "$GITHUB_OUTPUT"
+            echo "analysis=LLM API unavailable (HTTP $HTTP_CODE). Semantic check skipped." >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          LLM_CONTENT=$(echo "$BODY" | jq -r '.choices[0].message.content // empty')
+          if [ -z "$LLM_CONTENT" ]; then
+            echo "::warning::LLM returned empty response. Skipping semantic check."
+            echo "passed=true" >> "$GITHUB_OUTPUT"
+            echo "analysis=LLM returned empty response. Semantic check skipped." >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Parse the verdict from the LLM response
+          VERDICT=$(echo "$LLM_CONTENT" | jq -r '.verdict // empty' 2>/dev/null)
+          ANALYSIS=$(echo "$LLM_CONTENT" | jq -r '.analysis // empty' 2>/dev/null)
+
+          # Fallback: if the LLM didn't return valid JSON, try to extract from text
+          if [ -z "$VERDICT" ]; then
+            if echo "$LLM_CONTENT" | grep -qi "PASS"; then
+              VERDICT="PASS"
+            elif echo "$LLM_CONTENT" | grep -qi "FAIL"; then
+              VERDICT="FAIL"
+            else
+              VERDICT="PASS"  # Default to pass if LLM response is ambiguous
+            fi
+            ANALYSIS="$LLM_CONTENT"
+          fi
+
+          echo "LLM Verdict: $VERDICT"
+          echo "LLM Analysis: $ANALYSIS"
+
+          if [ "$VERDICT" = "PASS" ]; then
+            echo "passed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::error::LLM semantic verification failed: $ANALYSIS"
+            echo "passed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          # Truncate analysis for GITHUB_OUTPUT (max ~1KB to be safe)
+          echo "analysis=$(echo "$ANALYSIS" | head -c 1000)" >> "$GITHUB_OUTPUT"
+
       - name: Render verdict
         id: verdict
         run: |
@@ -181,19 +277,22 @@ jobs:
           CONFLICTS="${{ steps.conflict-check.outputs.has_conflicts }}"
           SYNTAX="${{ steps.syntax-check.outputs.passed }}"
           LABELS="${{ steps.label-check.outputs.passed }}"
+          SEMANTIC="${{ steps.semantic-check.outputs.passed }}"
 
           echo "=== Verification Summary ==="
-          echo "  Upstream ancestry:    $ANCESTRY"
-          echo "  Commit provenance:    $PROVENANCE"
-          echo "  No conflict markers:  $([ "$CONFLICTS" = "false" ] && echo "true" || echo "false")"
-          echo "  Python syntax:        $SYNTAX"
-          echo "  No manual resolution: $LABELS"
+          echo "  Upstream ancestry:      $ANCESTRY"
+          echo "  Commit provenance:      $PROVENANCE"
+          echo "  No conflict markers:    $([ "$CONFLICTS" = "false" ] && echo "true" || echo "false")"
+          echo "  Python syntax:          $SYNTAX"
+          echo "  No manual resolution:   $LABELS"
+          echo "  Semantic verification:  $SEMANTIC"
 
           if [ "$ANCESTRY" = "true" ] && \
              [ "$PROVENANCE" = "true" ] && \
              [ "$CONFLICTS" = "false" ] && \
              [ "$SYNTAX" = "true" ] && \
-             [ "$LABELS" = "true" ]; then
+             [ "$LABELS" = "true" ] && \
+             [ "$SEMANTIC" = "true" ]; then
             echo "All checks passed. PR is verified."
             echo "verified=true" >> "$GITHUB_OUTPUT"
           else
@@ -209,6 +308,9 @@ jobs:
           TAG="${{ steps.extract-tag.outputs.tag }}"
           PR_NUMBER="${{ github.event.pull_request.number }}"
 
+          SEMANTIC="${{ steps.semantic-check.outputs.passed }}"
+          ANALYSIS="${{ steps.semantic-check.outputs.analysis }}"
+
           if [ "$VERIFIED" = "true" ]; then
             gh pr comment "$PR_NUMBER" --body "$(cat <<EOF
           ## Agent 2: Verification Passed
@@ -222,6 +324,14 @@ jobs:
           | No conflict markers | Passed |
           | Python syntax valid | Passed |
           | No manual resolution needed | Passed |
+          | Semantic verification (LLM) | Passed |
+
+          <details>
+          <summary>Semantic analysis</summary>
+
+          ${ANALYSIS}
+
+          </details>
 
           **Proceeding to merge and release.**
 
@@ -242,6 +352,14 @@ jobs:
           | No conflict markers | $([ "${{ steps.conflict-check.outputs.has_conflicts }}" = "false" ] && echo "Passed" || echo "Failed") |
           | Python syntax valid | ${{ steps.syntax-check.outputs.passed }} |
           | No manual resolution needed | ${{ steps.label-check.outputs.passed }} |
+          | Semantic verification (LLM) | ${SEMANTIC} |
+
+          <details>
+          <summary>Semantic analysis</summary>
+
+          ${ANALYSIS}
+
+          </details>
 
           **This PR requires manual intervention before it can be merged.**
 

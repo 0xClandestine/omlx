@@ -142,6 +142,8 @@ jobs:
       - name: Rebase fork commits onto upstream release
         if: steps.check.outputs.needs_sync == 'true'
         id: rebase
+        env:
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
         run: |
           LATEST_TAG="${{ steps.detect.outputs.latest_tag }}"
           SYNC_BRANCH="${{ steps.detect.outputs.sync_branch }}"
@@ -159,20 +161,110 @@ jobs:
             COMMIT_LIST=$(git rev-list --reverse "${MERGE_BASE}..origin/${FORK_BRANCH}" --no-merges)
 
             # Cherry-pick each fork commit to preserve authorship and message.
-            # Using cherry-pick instead of rebase --onto to handle merge commits
-            # and maintain a linear history on the sync branch.
+            # On conflict, invoke LLM to attempt automatic resolution.
+            LLM_RESOLUTIONS=0
             for COMMIT_SHA in $COMMIT_LIST; do
-              echo "Cherry-picking $COMMIT_SHA: $(git log -1 --format='%s' "$COMMIT_SHA")"
-              if ! git cherry-pick "$COMMIT_SHA" --allow-empty; then
-                echo "::warning::Conflict cherry-picking $COMMIT_SHA."
-                echo "Unresolved conflicts detected. Aborting cherry-pick."
+              COMMIT_MSG=$(git log -1 --format='%s' "$COMMIT_SHA")
+              echo "Cherry-picking $COMMIT_SHA: $COMMIT_MSG"
+              if git cherry-pick "$COMMIT_SHA" --allow-empty; then
+                continue
+              fi
+
+              echo "::warning::Conflict cherry-picking $COMMIT_SHA. Invoking LLM for resolution..."
+
+              # Collect all conflicting files
+              CONFLICTED_FILES=$(git diff --name-only --diff-filter=U)
+              if [ -z "$CONFLICTED_FILES" ]; then
+                echo "No conflicted files found (unexpected). Aborting."
                 git cherry-pick --abort
                 echo "conflict=true" >> "$GITHUB_OUTPUT"
                 echo "conflict_commit=$COMMIT_SHA" >> "$GITHUB_OUTPUT"
-                echo "conflict_message=$(git log -1 --format='%s' "$COMMIT_SHA")" >> "$GITHUB_OUTPUT"
+                echo "conflict_message=$COMMIT_MSG" >> "$GITHUB_OUTPUT"
                 break
               fi
+
+              # Attempt LLM resolution for each conflicted file
+              RESOLUTION_FAILED=false
+              for FILE in $CONFLICTED_FILES; do
+                echo "  Resolving conflict in: $FILE"
+
+                # Build context for the LLM
+                CONFLICT_CONTENT=$(cat "$FILE")
+                FORK_PATCH=$(git log -1 -p "$COMMIT_SHA" -- "$FILE" 2>/dev/null || echo "(new file)")
+                UPSTREAM_CONTEXT=$(git log --oneline -5 "refs/tags/${LATEST_TAG}" -- "$FILE" 2>/dev/null || echo "(no recent changes)")
+
+                # Call OpenRouter API
+                RESPONSE=$(curl -s -w "\n%{http_code}" "https://openrouter.ai/api/v1/chat/completions" \
+                  -H "Authorization: Bearer $OPENROUTER_API_KEY" \
+                  -H "Content-Type: application/json" \
+                  -H "HTTP-Referer: https://github.com/0xClandestine/omlx" \
+                  -H "X-Title: Oval X Fork Sync Agent" \
+                  -d "$(jq -n \
+                    --arg file "$FILE" \
+                    --arg conflict "$CONFLICT_CONTENT" \
+                    --arg patch "$FORK_PATCH" \
+                    --arg upstream "$UPSTREAM_CONTEXT" \
+                    --arg commit_msg "$COMMIT_MSG" \
+                    '{
+                      model: "anthropic/claude-sonnet-4",
+                      max_tokens: 16384,
+                      messages: [{
+                        role: "system",
+                        content: "You are a git merge conflict resolver for a fork management system. You receive a file with git conflict markers and must produce the resolved file content. The fork-specific changes should be preserved while integrating cleanly with upstream changes. Return ONLY the resolved file content with no conflict markers, no markdown fencing, no commentary."
+                      }, {
+                        role: "user",
+                        content: ("Resolve this merge conflict.\n\nFile: " + $file + "\nFork commit: " + $commit_msg + "\n\nRecent upstream changes to this file:\n" + $upstream + "\n\nFork patch being applied:\n" + $patch + "\n\nFile with conflict markers:\n" + $conflict)
+                      }]
+                    }')" 2>/dev/null)
+
+                HTTP_CODE=$(echo "$RESPONSE" | tail -1)
+                BODY=$(echo "$RESPONSE" | sed '$d')
+
+                if [ "$HTTP_CODE" != "200" ]; then
+                  echo "  LLM API returned HTTP $HTTP_CODE for $FILE. Aborting resolution."
+                  RESOLUTION_FAILED=true
+                  break
+                fi
+
+                # Extract the resolved content from the response
+                RESOLVED=$(echo "$BODY" | jq -r '.choices[0].message.content // empty')
+                if [ -z "$RESOLVED" ]; then
+                  echo "  LLM returned empty resolution for $FILE. Aborting."
+                  RESOLUTION_FAILED=true
+                  break
+                fi
+
+                # Verify the resolution contains no conflict markers
+                if echo "$RESOLVED" | grep -q '^<<<<<<< \|^=======$\|^>>>>>>> '; then
+                  echo "  LLM resolution still contains conflict markers. Aborting."
+                  RESOLUTION_FAILED=true
+                  break
+                fi
+
+                # Apply the resolution
+                echo "$RESOLVED" > "$FILE"
+                git add "$FILE"
+                echo "  Resolved $FILE via LLM"
+              done
+
+              if [ "$RESOLUTION_FAILED" = true ]; then
+                git cherry-pick --abort
+                echo "conflict=true" >> "$GITHUB_OUTPUT"
+                echo "conflict_commit=$COMMIT_SHA" >> "$GITHUB_OUTPUT"
+                echo "conflict_message=$COMMIT_MSG" >> "$GITHUB_OUTPUT"
+                break
+              fi
+
+              # Commit the LLM-resolved cherry-pick
+              git cherry-pick --continue --no-edit || git commit --no-edit --allow-empty
+              LLM_RESOLUTIONS=$((LLM_RESOLUTIONS + 1))
+              echo "  Cherry-pick completed with LLM-assisted resolution"
             done
+
+            echo "llm_resolutions=$LLM_RESOLUTIONS" >> "$GITHUB_OUTPUT"
+            if [ "$LLM_RESOLUTIONS" -gt 0 ]; then
+              echo "::notice::$LLM_RESOLUTIONS conflict(s) resolved via LLM"
+            fi
           else
             echo "No fork-specific commits to rebase. Sync branch is a clean upstream tag."
           fi
@@ -218,14 +310,25 @@ jobs:
           CONFLICT_COMMIT="${{ steps.rebase.outputs.conflict_commit }}"
           CONFLICT_MSG="${{ steps.rebase.outputs.conflict_message }}"
           REBASE_HEAD="${{ steps.rebase.outputs.rebase_head }}"
+          LLM_RESOLUTIONS="${{ steps.rebase.outputs.llm_resolutions }}"
           FORK_COMMITS=$(cat /tmp/fork-commits.txt 2>/dev/null || echo "(none)")
 
           # Build conflict warning section if applicable
           CONFLICT_SECTION=""
           if [ "$CONFLICT" = "true" ]; then
             CONFLICT_SECTION=$(cat <<INNER
-          > **Warning**: Rebase encountered a conflict at commit \`${CONFLICT_COMMIT}\` ("${CONFLICT_MSG}").
-          > Manual resolution is required before this PR can be merged.
+          > **Warning**: Rebase encountered an unresolvable conflict at commit \`${CONFLICT_COMMIT}\` ("${CONFLICT_MSG}").
+          > The LLM was unable to resolve this conflict. Manual resolution is required.
+          INNER
+          )
+          fi
+
+          # Build LLM resolution notice if applicable
+          LLM_SECTION=""
+          if [ "${LLM_RESOLUTIONS:-0}" -gt 0 ]; then
+            LLM_SECTION=$(cat <<INNER
+          > **Note**: ${LLM_RESOLUTIONS} conflict(s) were automatically resolved via LLM (OpenRouter).
+          > Agent 2 will perform semantic verification of these resolutions.
           INNER
           )
           fi
@@ -234,6 +337,9 @@ jobs:
           LABELS="upstream-sync,automated"
           if [ "$CONFLICT" = "true" ]; then
             LABELS="${LABELS},needs-manual-resolution"
+          fi
+          if [ "${LLM_RESOLUTIONS:-0}" -gt 0 ]; then
+            LABELS="${LABELS},llm-resolved"
           fi
 
           gh pr create \
@@ -250,8 +356,10 @@ jobs:
           - Detected new upstream release: [\`${LATEST_TAG}\`](https://github.com/${UPSTREAM_REPO}/releases/tag/${LATEST_TAG})
           - Upstream tag commit: \`${UPSTREAM_TAG_SHA}\`
           - Fork-specific commits were cherry-picked on top of the upstream tag to preserve provenance.
+          - LLM-assisted conflict resolutions: **${LLM_RESOLUTIONS:-0}**
 
           ${CONFLICT_SECTION}
+          ${LLM_SECTION}
 
           ### Fork commit provenance
 
@@ -265,7 +373,7 @@ jobs:
           - **New HEAD after rebase**: \`${REBASE_HEAD}\`
 
           ### Next steps
-          **Agent 2 (Verification)** will automatically validate this PR and, if the rebase is correct, merge it and cut a release.
+          **Agent 2 (Verification)** will automatically validate this PR. This includes semantic analysis of the rebase diff and any LLM-resolved conflicts.
 
           ---
           *This PR is managed by the Oval X autonomous fork sync pipeline.*

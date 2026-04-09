@@ -31,21 +31,26 @@ def:
           description: |
             Polls `jundot/omlx` for new releases on a 6-hour cron. When a new release is
             detected, cherry-picks fork-specific commits onto the upstream tag preserving
-            full commit provenance, and opens a PR for Agent 2.
+            full commit provenance. On conflict, invokes an LLM (via OpenRouter) to
+            attempt automatic resolution. Opens a PR for Agent 2 with provenance and
+            resolution metadata.
           globs:
             - ".github/workflows/agent-upstream-sync.yml"
 
         - title: "Agent 2: Verify & Release"
           description: |
-            Validates Agent 1's rebase work — checks ancestry, commit provenance,
-            conflict markers, Python syntax, and label state. On pass, merges to `main`
-            and cuts a versioned fork release.
+            Validates Agent 1's rebase work with both deterministic checks (ancestry,
+            provenance, conflict markers, Python syntax, labels) and agentic analysis
+            (LLM semantic verification of the rebase diff via OpenRouter). Pays extra
+            attention to LLM-resolved conflicts. On pass, merges to `main` and cuts a
+            versioned fork release.
           globs:
             - ".github/workflows/agent-verify-release.yml"
 
         - title: "Egress rules"
           description: |
-            Iron Proxy domain allowlist. Restricts all CI egress to GitHub domains only.
+            Iron Proxy domain allowlist. Restricts CI egress to GitHub and OpenRouter
+            (for LLM inference) domains only.
           globs:
             - "egress-rules.yaml"
 
