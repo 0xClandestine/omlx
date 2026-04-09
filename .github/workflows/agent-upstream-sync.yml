@@ -179,6 +179,25 @@ jobs:
 
           echo "rebase_head=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
+      - name: Update fork.yaml hash pins
+        if: steps.check.outputs.needs_sync == 'true'
+        run: |
+          UPSTREAM_TAG_SHA="${{ steps.check.outputs.upstream_tag_sha }}"
+          REBASE_HEAD=$(git rev-parse HEAD)
+
+          # Update the base hash (upstream pin) in fork.yaml
+          sed -i "s/^  hash: .* # Upstream release pin/  hash: ${UPSTREAM_TAG_SHA} # Upstream release pin/" fork.yaml
+          # Update the fork hash (downstream pin) in fork.yaml
+          sed -i "s/^  hash: .* # Fork HEAD pin/  hash: ${REBASE_HEAD} # Fork HEAD pin/" fork.yaml
+
+          if git diff --quiet fork.yaml; then
+            echo "fork.yaml already up to date"
+          else
+            git add fork.yaml
+            git commit -m "fork: update hash pins for ${{ steps.detect.outputs.latest_tag }}"
+            echo "Updated fork.yaml: base=$UPSTREAM_TAG_SHA fork=$REBASE_HEAD"
+          fi
+
       - name: Push sync branch
         if: steps.check.outputs.needs_sync == 'true'
         run: |

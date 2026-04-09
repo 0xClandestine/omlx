@@ -1,0 +1,69 @@
+title: "Oval X oMLX Fork"
+footer: |
+  [Oval X oMLX](https://github.com/0xClandestine/omlx) fork overview &middot; created with [Forkdiff](https://github.com/protolambda/forkdiff)
+base:
+  name: jundot/omlx
+  url: https://github.com/jundot/omlx
+  # Upstream release pin — updated automatically by Agent 1 on each sync
+  hash: b04ed04bb0c2eac404c18af1d30c8cc3811210b6
+fork:
+  name: 0xClandestine/omlx
+  url: https://github.com/0xClandestine/omlx
+  # Fork HEAD pin — updated automatically by Agent 1 on each sync
+  hash: b04ed04bb0c2eac404c18af1d30c8cc3811210b6
+def:
+  title: "Oval X oMLX Fork Diff Overview"
+  description: |
+    The original oMLX codebase can be found at [`github.com/jundot/omlx`](https://github.com/jundot/omlx).
+    The Oval X fork at [`github.com/0xClandestine/omlx`](https://github.com/0xClandestine/omlx).
+
+    This fork is autonomously managed. Agent 1 (Upstream Sync) monitors upstream releases
+    and rebases fork-specific changes on top of each new tag. Agent 2 (Verify & Release)
+    validates the rebase and cuts a release. Both agents run behind
+    [Iron Proxy](https://github.com/ironsh/iron-proxy-action) egress enforcement.
+
+  sub:
+    - title: "Fork Management Pipeline"
+      description: |
+        Autonomous CI agents for tracking upstream releases, rebasing fork commits,
+        verifying integrity, and cutting releases. All outbound traffic is locked down
+        via Iron Proxy egress rules.
+      sub:
+        - title: "Agent 1: Upstream Sync"
+          description: |
+            Polls `jundot/omlx` for new releases on a 6-hour cron. When a new release is
+            detected, cherry-picks fork-specific commits onto the upstream tag preserving
+            full commit provenance, and opens a PR for Agent 2.
+          globs:
+            - ".github/workflows/agent-upstream-sync.yml"
+
+        - title: "Agent 2: Verify & Release"
+          description: |
+            Validates Agent 1's rebase work — checks ancestry, commit provenance,
+            conflict markers, Python syntax, and label state. On pass, merges to `main`
+            and cuts a versioned fork release.
+          globs:
+            - ".github/workflows/agent-verify-release.yml"
+
+        - title: "Egress rules"
+          description: |
+            Iron Proxy domain allowlist. Restricts all CI egress to GitHub domains only.
+          globs:
+            - "egress-rules.yaml"
+
+        - title: "Fork diff manifest"
+          description: |
+            This file. Documents the fork diff using [protolambda/forkdiff](https://github.com/protolambda/forkdiff)
+            format. Hash pins are updated automatically by Agent 1 on each upstream sync.
+          globs:
+            - "fork.yaml"
+
+        - title: "Fork diff page"
+          description: |
+            GitHub Pages workflow to build and deploy the forkdiff HTML summary.
+          globs:
+            - ".github/workflows/pages.yml"
+
+ignore:
+  - "*.sum"
+  - "fork.yaml"
