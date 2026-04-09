@@ -1,10 +1,13 @@
 # Build and deploy fork diff summary to GitHub Pages using protolambda/forkdiff.
-# Runs on pushes to main and can be triggered manually.
+# Runs on every push to main (sync merges, manual PRs, direct pushes) and on manual trigger.
+#
+# Before building, the fork.hash pin in fork.yaml is updated to the current HEAD
+# so the rendered diff always reflects the actual state of the fork.
 
 name: "Fork Diff Pages"
 
 permissions:
-  contents: read
+  contents: write
   pages: write
   id-token: write
 
@@ -23,11 +26,29 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Fetch upstream for diff
         run: |
           git remote add upstream https://github.com/jundot/omlx.git 2>/dev/null || true
           git fetch upstream --tags
+
+      - name: Update fork.yaml hash pins
+        run: |
+          FORK_HEAD=$(git rev-parse HEAD)
+          CURRENT_FORK_HASH=$(grep '# Fork HEAD pin' fork.yaml | sed 's/.*hash: \([a-f0-9]*\).*/\1/')
+
+          if [ "$FORK_HEAD" = "$CURRENT_FORK_HASH" ]; then
+            echo "fork.hash already current ($FORK_HEAD)"
+          else
+            sed -i "s/^  hash: .* # Fork HEAD pin/  hash: ${FORK_HEAD} # Fork HEAD pin/" fork.yaml
+            git config user.name "oval-x-sync[bot]"
+            git config user.email "oval-x-sync[bot]@users.noreply.github.com"
+            git add fork.yaml
+            git commit -m "fork: update fork hash pin to $(echo $FORK_HEAD | cut -c1-12)"
+            git push origin main
+            echo "Updated fork.hash: $CURRENT_FORK_HASH -> $FORK_HEAD"
+          fi
 
       - name: Build forkdiff
         uses: "docker://protolambda/forkdiff:0.1.0"
