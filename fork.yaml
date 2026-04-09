@@ -4,13 +4,11 @@ footer: |
 base:
   name: jundot/omlx
   url: https://github.com/jundot/omlx
-  # Upstream release pin — updated automatically by Agent 1 on each sync
-  hash: b04ed04bb0c2eac404c18af1d30c8cc3811210b6
+  hash: b04ed04bb0c2eac404c18af1d30c8cc3811210b6 # upstream-pin
 fork:
   name: 0xClandestine/omlx
   url: https://github.com/0xClandestine/omlx
-  # Fork HEAD pin — updated automatically by Agent 1 on each sync
-  hash: b04ed04bb0c2eac404c18af1d30c8cc3811210b6
+  hash: b04ed04bb0c2eac404c18af1d30c8cc3811210b6 # fork-pin
 def:
   title: "Oval X oMLX Fork Diff Overview"
   description: |

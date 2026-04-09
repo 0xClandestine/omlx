@@ -186,9 +186,9 @@ jobs:
           REBASE_HEAD=$(git rev-parse HEAD)
 
           # Update the base hash (upstream pin) in fork.yaml
-          sed -i "s/^  hash: .* # Upstream release pin/  hash: ${UPSTREAM_TAG_SHA} # Upstream release pin/" fork.yaml
+          sed -i "s/^  hash: .* # upstream-pin/  hash: ${UPSTREAM_TAG_SHA} # upstream-pin/" fork.yaml
           # Update the fork hash (downstream pin) in fork.yaml
-          sed -i "s/^  hash: .* # Fork HEAD pin/  hash: ${REBASE_HEAD} # Fork HEAD pin/" fork.yaml
+          sed -i "s/^  hash: .* # fork-pin/  hash: ${REBASE_HEAD} # fork-pin/" fork.yaml
 
           if git diff --quiet fork.yaml; then
             echo "fork.yaml already up to date"
