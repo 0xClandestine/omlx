@@ -231,6 +231,28 @@ def maybe_apply_pre_load_patches(
                     model_name,
                 )
 
+    # Bonsai 1-bit AFFINE (uint32) load patch. Stock mlx cannot construct a
+    # bits=1 QuantizedLinear/Embedding (mx.quantize rejects bits=1), so the
+    # standard prism-ml/Bonsai-*-mlx-1bit checkpoints die at build time before
+    # the bonsai_qmv decode kernel is ever reached. This lets construction
+    # succeed (placeholder buffers) and routes bits=1 matmul through the native
+    # kernel (decode) / dequant (prefill). Applied after t5 so our
+    # quantized_matmul wrapper chains on top of the t5 one.
+    if quant_bits == 1:
+        try:
+            from ..patches.bonsai_affine1_load import (
+                apply_bonsai_affine1_load_patch,
+            )
+        except Exception as e:
+            logger.debug("bonsai affine1 load patch import failed: %s", e)
+        else:
+            if apply_bonsai_affine1_load_patch():
+                logger.info(
+                    "Bonsai 1-bit affine load patch applied for %s "
+                    "(uint32 bits=1 construction + decode/prefill routing)",
+                    model_name,
+                )
+
     model_type = config.get("model_type")
     if isinstance(model_type, str) and model_type.startswith("deepseek_v4"):
         from ..patches.deepseek_v4 import apply_deepseek_v4_patch
