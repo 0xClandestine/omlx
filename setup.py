@@ -16,9 +16,53 @@ def _with_custom_kernel() -> bool:
     return os.environ.get("OMLX_WITH_CUSTOM_KERNEL", "").strip().lower() in TRUTHY
 
 
+# MLX vendors nanobind via FetchContent (a pinned GIT_TAG in its CMakeLists),
+# and our custom-kernel extensions share MLX's `mlx` NB_DOMAIN. If the nanobind
+# used to build the extension differs (by ABI) from the one MLX was built with,
+# the build SUCCEEDS but every `mlx.core.array` is rejected at the type caster
+# ("incompatible function arguments"), so the native kernel silently disables
+# itself at import (fast.has_native() -> False). Fail loudly at build time with
+# the exact version to install instead of shipping a dead kernel.
+#
+# Map of MLX minor version -> the nanobind tag it pins:
+#   0.32.x  (stock upstream)      -> 2.13.0
+#   0.31.x  (PrismML 1-bit fork)  -> 2.12.0
+# Extend as new MLX builds are targeted; unknown MLX versions pass through.
+_MLX_NANOBIND_ABI = {
+    "0.32": "2.13.0",
+    "0.31": "2.12.0",
+}
+
+
+def _verify_nanobind_abi() -> None:
+    try:
+        from importlib import metadata as _md
+
+        mlx_ver = _md.version("mlx")
+        nb_ver = _md.version("nanobind")
+    except Exception:
+        # Can't introspect (e.g. build isolation) — defer to build-system pins.
+        return
+
+    want = _MLX_NANOBIND_ABI.get(".".join(mlx_ver.split(".")[:2]))
+    if want and nb_ver != want:
+        raise SystemExit(
+            "omlx custom-kernel build: nanobind ABI mismatch.\n"
+            f"  installed mlx      = {mlx_ver} (built against nanobind {want})\n"
+            f"  installed nanobind = {nb_ver}\n"
+            "Building against this nanobind would produce a kernel that rejects "
+            "every mlx.core.array at runtime (isolated `mlx` NB_DOMAIN), so "
+            "fast.has_native() stays False. Fix:\n"
+            f"    pip install 'nanobind=={want}'\n"
+            "then rebuild with OMLX_WITH_CUSTOM_KERNEL=1."
+        )
+
+
 def _custom_kernel_build_kwargs() -> dict:
     if not _with_custom_kernel():
         return {}
+
+    _verify_nanobind_abi()
 
     target = (
         os.environ.get("OMLX_CUSTOM_KERNEL_DEPLOYMENT_TARGET")
