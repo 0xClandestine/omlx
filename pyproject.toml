@@ -8,6 +8,13 @@ requires = [
     # A mismatched nanobind isolates the `mlx` NB_DOMAIN, so custom kernel
     # extensions (omlx.custom_kernels.*) reject every mlx.core.array at the
     # type caster with `incompatible function arguments`.
+    #
+    # NOTE: these pins target STOCK MLX. When building the bonsai 1-bit kernels
+    # against the PrismML MLX fork (mlx 0.31.2), that fork pins nanobind v2.12.0,
+    # so a matching build needs `nanobind==2.12.0`. Such fork builds use
+    # `--no-build-isolation` (so these pins are bypassed and the venv's nanobind
+    # is used); setup.py:_verify_nanobind_abi() hard-fails with the exact version
+    # if the venv nanobind doesn't match the installed mlx.
     "nanobind==2.13.0",
     "mlx==0.32.0",
 ]
