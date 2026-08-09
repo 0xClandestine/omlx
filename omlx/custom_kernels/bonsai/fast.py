@@ -551,6 +551,26 @@ def bonsai_t5_qmm_steel(
     )
 
 
+def bonsai_t5_qmm_steel_trit(
+    x: mx.array,
+    w: mx.array,
+    scales: mx.array,
+    stream=None,
+) -> mx.array:
+    """t5 steel GEMM, per-trit loader A/B variant (T5_TO_B4 extraction).
+
+    Experimental: same pipeline as bonsai_t5_qmm_steel but the W-tile loader
+    uses the original per-trit T5_TO_B4 extraction instead of the packed
+    half4 tables. Used for loader A/B measurement.
+    """
+    if _ext is not None and has_symbol("bonsai_t5_qmm_steel_trit"):
+        return _ext.bonsai_t5_qmm_steel_trit(x, w, scales, stream=stream)
+    raise RuntimeError(
+        "bonsai_t5_qmm_steel_trit: native extension unavailable. "
+        "Rebuild the bonsai extension."
+    )
+
+
 # ---------------------------------------------------------------------------
 # spec_decode_verify
 # ---------------------------------------------------------------------------

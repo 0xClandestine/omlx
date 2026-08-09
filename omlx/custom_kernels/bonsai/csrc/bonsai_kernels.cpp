@@ -534,10 +534,12 @@ static std::string qmm_t5_nomul_kname(const std::string& type, int group_size) {
     return "affine_qmm_t5_nomul_" + type + "_gs_" + std::to_string(group_size);
 }
 
-// affine_qmm_t5_steel_<type>_gs_<gs>_alN_<true|false>
+// affine_qmm_t5_steel_[swar_]<type>_gs_<gs>_alN_<true|false>
 static std::string qmm_t5_steel_kname(
-    const std::string& type, int group_size, bool aligned_N) {
-    return "affine_qmm_t5_steel_" + type + "_gs_" + std::to_string(group_size)
+    const std::string& type, int group_size, bool aligned_N, bool swar = false) {
+    return std::string("affine_qmm_t5_steel_")
+        + (swar ? "swar_" : "trit_") + type
+        + "_gs_" + std::to_string(group_size)
         + "_alN_" + (aligned_N ? "true" : "false");
 }
 
@@ -638,11 +640,12 @@ static void dispatch_qmm_t5_steel(
     array& out,
     int M, int N, int K,
     int group_size,
+    bool swar,
     metal::Device& d,
     const Stream& s) {
 
     bool aligned = N % 32 == 0;
-    std::string kname = qmm_t5_steel_kname(type_str(x.dtype()), group_size, aligned);
+    std::string kname = qmm_t5_steel_kname(type_str(x.dtype()), group_size, aligned, swar);
     auto kernel = get_bonsai_kernel(d, kname);
     auto& enc   = metal::get_command_encoder(s);
     enc.set_compute_pipeline_state(kernel);
@@ -664,9 +667,11 @@ static void dispatch_qmm_t5_steel(
 
 class BonsaiT5QmmSteelPrimitive : public Primitive {
  public:
-    explicit BonsaiT5QmmSteelPrimitive(Stream s) : Primitive(s) {}
+    explicit BonsaiT5QmmSteelPrimitive(Stream s, bool swar = false)
+        : Primitive(s), swar_(swar) {}
 
  private:
+    bool swar_;
     void eval_cpu(
         const std::vector<array>& /* inputs */,
         std::vector<array>& /* outputs */) override {
@@ -691,7 +696,7 @@ class BonsaiT5QmmSteelPrimitive : public Primitive {
         int K          = n_groups * group_size;
         int M          = static_cast<int>(x.size()) / K;
 
-        dispatch_qmm_t5_steel(x, w, scales, out, M, N, K, group_size, d, s);
+        dispatch_qmm_t5_steel(x, w, scales, out, M, N, K, group_size, swar_, d, s);
     }
 
     DEFINE_NAME(BonsaiT5QmmSteelPrimitive)
@@ -1051,7 +1056,24 @@ array bonsai_t5_qmm_steel(
     auto out_shape = x_c.shape();
     out_shape.back() = N;
     return array(out_shape, x_c.dtype(),
-        std::make_shared<BonsaiT5QmmSteelPrimitive>(s),
+        std::make_shared<BonsaiT5QmmSteelPrimitive>(s, /*swar=*/true),
+        {x_c, w, sc});
+}
+
+// Per-trit loader A/B variant (measurement): original T5_TO_B4 extraction.
+array bonsai_t5_qmm_steel_trit(
+    const array& x,
+    const array& w,
+    const array& scales,
+    StreamOrDevice s_) {
+    auto s   = to_stream(s_);
+    auto x_c = ensure_row_contiguous(x, s);
+    auto sc  = ensure_dtype(scales, x_c.dtype(), s);
+    int N = static_cast<int>(w.shape(-2));
+    auto out_shape = x_c.shape();
+    out_shape.back() = N;
+    return array(out_shape, x_c.dtype(),
+        std::make_shared<BonsaiT5QmmSteelPrimitive>(s, /*swar=*/false),
         {x_c, w, sc});
 }
 

@@ -336,7 +336,8 @@ bonsai_qmm_t5_nomul_types(128)
 // Buffer layout mirrors the other affine_qmm_t5 kernels; aligned_N selects
 // whether N is a multiple of the 32-wide N-tile.
 
-template <typename T, int group_size, bool aligned_N>
+// variant selector: V=0 per-trit T5_TO_B4 loader, V=1 SWAR half4 loader
+template <typename T, int group_size, bool aligned_N, int V>
 [[kernel]] void affine_qmm_t5_steel(
     const device uint8_t* w  [[buffer(0)]],
     const device T* scales   [[buffer(1)]],
@@ -353,26 +354,44 @@ template <typename T, int group_size, bool aligned_N>
     constexpr int BK_padded = 32 + 16 / sizeof(T);
     threadgroup T Xs[32 * BK_padded];
     threadgroup T Ws[32 * BK_padded];
-    qmm_t5_steel_impl<T, group_size, aligned_N>(
+    qmm_t5_steel_impl<T, (V == 1), group_size, aligned_N>(
         w, scales, x, out, Xs, Ws, K, N, M, K, tid, lid, simd_gid, simd_lid);
 }
 
-#define bonsai_instantiate_qmm_t5_steel(type, gs, al) \
-  instantiate_kernel(                                  \
-      "affine_qmm_t5_steel_" #type "_gs_" #gs         \
-          "_alN_" #al,                                 \
-      affine_qmm_t5_steel, type, gs, al)
+// V=0: per-trit T5_TO_B4 loader (baseline commit).  V=1: SWAR half4 loader.
+// (Names spelled out per family: [[host_name]] rejects stringized macro args.)
+#define bonsai_instantiate_qmm_t5_steel_trit(type, gs, al) \
+  instantiate_kernel(                                      \
+      "affine_qmm_t5_steel_trit_" #type "_gs_" #gs        \
+          "_alN_" #al,                                     \
+      affine_qmm_t5_steel, type, gs, al, 0)
 
-#define bonsai_qmm_t5_steel_types(gs)                   \
-  bonsai_instantiate_qmm_t5_steel(float, gs, true)      \
-  bonsai_instantiate_qmm_t5_steel(float, gs, false)     \
-  bonsai_instantiate_qmm_t5_steel(float16_t, gs, true)  \
-  bonsai_instantiate_qmm_t5_steel(float16_t, gs, false) \
-  bonsai_instantiate_qmm_t5_steel(bfloat16_t, gs, true) \
-  bonsai_instantiate_qmm_t5_steel(bfloat16_t, gs, false)
+#define bonsai_instantiate_qmm_t5_steel_swar(type, gs, al) \
+  instantiate_kernel(                                      \
+      "affine_qmm_t5_steel_swar_" #type "_gs_" #gs        \
+          "_alN_" #al,                                     \
+      affine_qmm_t5_steel, type, gs, al, 1)
 
-bonsai_qmm_t5_steel_types(64)
-bonsai_qmm_t5_steel_types(128)
+#define bonsai_qmm_t5_steel_trit_types(gs)              \
+  bonsai_instantiate_qmm_t5_steel_trit(float, gs, true)      \
+  bonsai_instantiate_qmm_t5_steel_trit(float, gs, false)     \
+  bonsai_instantiate_qmm_t5_steel_trit(float16_t, gs, true)  \
+  bonsai_instantiate_qmm_t5_steel_trit(float16_t, gs, false) \
+  bonsai_instantiate_qmm_t5_steel_trit(bfloat16_t, gs, true) \
+  bonsai_instantiate_qmm_t5_steel_trit(bfloat16_t, gs, false)
+
+#define bonsai_qmm_t5_steel_swar_types(gs)              \
+  bonsai_instantiate_qmm_t5_steel_swar(float, gs, true)      \
+  bonsai_instantiate_qmm_t5_steel_swar(float, gs, false)     \
+  bonsai_instantiate_qmm_t5_steel_swar(float16_t, gs, true)  \
+  bonsai_instantiate_qmm_t5_steel_swar(float16_t, gs, false) \
+  bonsai_instantiate_qmm_t5_steel_swar(bfloat16_t, gs, true) \
+  bonsai_instantiate_qmm_t5_steel_swar(bfloat16_t, gs, false)
+
+bonsai_qmm_t5_steel_trit_types(64)
+bonsai_qmm_t5_steel_trit_types(128)
+bonsai_qmm_t5_steel_swar_types(64)
+bonsai_qmm_t5_steel_swar_types(128)
 
 
 

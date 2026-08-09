@@ -174,6 +174,13 @@ array bonsai_t5_qmm_steel(
     const array& scales,
     StreamOrDevice s = {});
 
+// Per-trit loader A/B measurement variant (original T5_TO_B4 extraction).
+array bonsai_t5_qmm_steel_trit(
+    const array& x,
+    const array& w,
+    const array& scales,
+    StreamOrDevice s = {});
+
 std::pair<array, array> bonsai_spec_decode_verify(
     const array& draft,
     const array& target,
