@@ -958,6 +958,18 @@ def apply_post_load_transforms(model: Any, model_settings: Any = None) -> Any:
     except Exception:
         logger.debug("t5 bias free skipped", exc_info=True)
 
+    # Maple-style decode fusion (qkv / up-gate projections + fused norms).
+    # Each fused path probe-latches at first use, so a mismatch permanently
+    # falls back to the sequential path — never wrong, only faster when exact.
+    try:
+        from ..patches.bonsai_decode_fusion import apply_bonsai_decode_fusion
+
+        n_fused = apply_bonsai_decode_fusion(model)
+        if n_fused:
+            logger.info("bonsai_decode_fusion: fused %d decode sites", n_fused)
+    except Exception:
+        logger.debug("bonsai_decode_fusion skipped", exc_info=True)
+
     if model_settings is None:
         return model
 
