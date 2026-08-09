@@ -467,6 +467,62 @@ def bonsai_t5_qmm(
     )
 
 
+def bonsai_t5_qmm_lut(
+    x: mx.array,
+    w: mx.array,
+    scales: mx.array,
+    stream=None,
+) -> mx.array:
+    """t5 LUT-GEMM for prefill (Identity I-M, paired-trit μ=2 table-dot).
+
+    LUT-gather variant of bonsai_t5_qmm: replaces the per-trit dequant +
+    simdgroup MMA with 9-entry pair tables built per (row, t5 byte) in
+    threadgroup memory (ping-pong double-buffered). Multiply-free build and
+    gather; only the per-row scale is an FMA.
+
+    Parameters
+    ----------
+    x      : [M, K]                  activations (float16 or bfloat16)
+    w      : [N, n_groups*bpg]       uint8 t5 weight bytes
+    scales : [N, n_groups]           scale per group
+    Returns [M, N].
+    """
+    if _ext is not None and has_symbol("bonsai_t5_qmm_lut"):
+        return _ext.bonsai_t5_qmm_lut(x, w, scales, stream=stream)
+    raise RuntimeError(
+        "bonsai_t5_qmm_lut: native extension unavailable. "
+        "Rebuild the bonsai extension."
+    )
+
+
+def bonsai_t5_qmm_nomul(
+    x: mx.array,
+    w: mx.array,
+    scales: mx.array,
+    stream=None,
+) -> mx.array:
+    """t5 select/add GEMM for prefill (Identity I-M, μ=1 fallback).
+
+    Multiplication-free variant: no lookup tables; each t5 byte is decoded
+    through T5_TO_B4 and the 5 trit contributions are accumulated with pure
+    select/add (trit-1 ∈ {-1,0,1} → x, 0, -x). Only the per-row scale is an
+    FMA. Numerically identical to bonsai_t5_qmm within fp16 rounding.
+
+    Parameters
+    ----------
+    x      : [M, K]                  activations (float16 or bfloat16)
+    w      : [N, n_groups*bpg]       uint8 t5 weight bytes
+    scales : [N, n_groups]           scale per group
+    Returns [M, N].
+    """
+    if _ext is not None and has_symbol("bonsai_t5_qmm_nomul"):
+        return _ext.bonsai_t5_qmm_nomul(x, w, scales, stream=stream)
+    raise RuntimeError(
+        "bonsai_t5_qmm_nomul: native extension unavailable. "
+        "Rebuild the bonsai extension."
+    )
+
+
 # ---------------------------------------------------------------------------
 # spec_decode_verify
 # ---------------------------------------------------------------------------

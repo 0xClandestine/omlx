@@ -1746,6 +1746,412 @@ METAL_FUNC void qmm_t5_impl(
   }
 }
 
+// ---------------------------------------------------------------------------
+// qmm_t5_lut_impl: LUT-gather GEMM for t5 ternary weights (paired-trit variant).
+//
+// out[M, N] = x[M, K] @ t5_decode(w[N, K]).T  (float32 accumulate)
+//
+// Replaces qmm_t5_impl's per-trit dequant + simdgroup MMA with paired-trit
+// lookup tables (μ=2, 9 entries each — the reuse factor of the 32×32 tile is
+// 3^5/32 ≈ 7.6, so a 243-entry table would cost ~69× the reference inner loop:
+// μ=2 amortises the table build ~32× over the N-tile instead).
+//
+// For each (M-tile row m, byte b) of a K-group, two 9-entry fp32 tables encode
+// the byte's trit pairs (t0,t1) and (t2,t3); the leftover trit t4 (the
+// 1-of-5 singleton) is handled by direct select, no table:
+//
+//   q encodes a pair as q = 3*t_hi + t_lo (hi = q/3, lo = q%3)
+//   T_pair[q] = x_lo*(lo-1) + x_hi*(hi-1)
+//             = -(x_lo+x_hi) + (lo==1? x_lo : lo==2? 2*x_lo : 0)
+//                           + (hi==1? x_hi : hi==2? 2*x_hi : 0)   (digit-DP)
+//   sgl(d, x4) = (d==2)? x4 : (d==1)? 0 : -x4        (d = trit t4 ∈ {0,1,2})
+//
+//   acc[m, n] += scale[n, g] * (T0_m[q0] + T1_m[q1] + sgl(t4, x4_m))
+//
+// Tables live in a ping-pong double buffer (2 × 2 pairs × 32 rows × 33-float
+// pitch + 2 × 32-float x4 staging = 17.2 KB), so byte b+1's tables are built
+// while byte b's are being gathered → 1 barrier per byte (27/K-group vs 2).
+//
+// Grid: (ceil(N/32), ceil(M/32), B)  Threadgroup: (32, 4, 1) — identical to
+// qmm_t5_impl, so the C++ dispatch and instantiations mirror it exactly.
+//
+// Thread assignment (lane_in_tg = sg_id*32 + lane, 0..127):
+//   table build : 288 items (32 rows × 9 q) per byte, item = lane_in_tg + 128*i
+//                 (row = item/9, q = item%9) — x values re-read per q (L1-hit)
+//   gather      : same fragment layout (sm, sn, fm, fn0, fn1) as qmm_t5_impl
+// ---------------------------------------------------------------------------
+// Build the μ=2 pair tables (and singleton-x4 staging) for byte b of group g
+// into ping-pong buffer `buf`. 288 items (32 rows × 9 pair-entries), each item
+// computes one entry of T0 (trit pair t0,t1) and T1 (t2,t3) via the digit-DP
+// recurrence; x values are re-read per q (L1-hit), guarded at the group
+// boundary so the partial last byte's padding trits contribute zero.
+template <typename T, int group_size, int TBL_P>
+METAL_FUNC void lut2_build_byte(
+    const device T* x,
+    int M, int K, int g, uint b, uint buf,
+    uint m_base, uint lane_in_tg,
+    threadgroup float* tables,
+    threadgroup float* x4s) {
+  const uint kbase = (uint)(g * group_size) + b * 5u;
+  const uint gend  = (uint)((g + 1) * group_size);
+  for (uint item = lane_in_tg; item < 32u * 9u; item += 128u) {
+    const uint row = item / 9u;
+    const uint q   = item - row * 9u;
+    const uint m_row = m_base + row;
+    const device T* xp = x + min(m_row, (uint)(M - 1)) * (uint)K + kbase;
+    const bool mok = m_row < (uint)M;
+    float x0 = mok                        ? float(xp[0]) : 0.f;
+    float x1 = (mok && kbase + 1u < gend) ? float(xp[1]) : 0.f;
+    float x2 = (mok && kbase + 2u < gend) ? float(xp[2]) : 0.f;
+    float x3 = (mok && kbase + 3u < gend) ? float(xp[3]) : 0.f;
+    float x4 = (mok && kbase + 4u < gend) ? float(xp[4]) : 0.f;
+    const uint hi = (q * 171u) >> 9u;     // q/3 (t5_div3, exact for q ≤ 8)
+    const uint lo = q - 3u * hi;          // q%3
+    float t0 = -(x0 + x1);
+    t0 += (hi == 1u) ? x0 : ((hi == 2u) ? x0 + x0 : 0.f);
+    t0 += (lo == 1u) ? x1 : ((lo == 2u) ? x1 + x1 : 0.f);
+    float t1 = -(x2 + x3);
+    t1 += (hi == 1u) ? x2 : ((hi == 2u) ? x2 + x2 : 0.f);
+    t1 += (lo == 1u) ? x3 : ((lo == 2u) ? x3 + x3 : 0.f);
+    tables[((buf * 2u)      * 32u + row) * (uint)TBL_P + q] = t0;
+    tables[((buf * 2u + 1u) * 32u + row) * (uint)TBL_P + q] = t1;
+    x4s[buf * 32u + row] = x4;
+  }
+}
+
+template <typename T, int group_size>
+METAL_FUNC void qmm_t5_lut_impl(
+    const device uint8_t* w,    // (N, n_groups * bpg) t5 bytes
+    const device T* scales,     // (N, n_groups)
+    const device T* x,          // (M, K)
+    device T* out,              // (M, N)
+    const constant int& M_c,
+    const constant int& N_c,
+    const constant int& K_c,
+    threadgroup float* tables,  // [2][2][32][33] ping-pong pair tables (caller)
+    threadgroup float* x4s,     // [2][32] singleton-x4 staging (caller)
+    uint2 tgid,                  // (n_tile, m_tile)
+    uint  lane,                  // thread_index_in_simdgroup  (0..31)
+    uint  sg_id)                 // simdgroup_index_in_threadgroup (0..3)
+{
+  constexpr int bpg    = (group_size + 4) / 5;   // bytes per group
+  constexpr int BM = 32, BN = 32;
+  constexpr int TBL_P = 33;                     // row pitch: (33r+q)%32 = (r+q)%32
+  (void)BM; (void)BN;
+
+  // Accumulators: acc0..acc3 = (om0, on0/on1/on80/on81), acc4..acc7 = (om1, ...).
+  float acc0 = 0.f, acc1 = 0.f, acc2 = 0.f, acc3 = 0.f;
+  float acc4 = 0.f, acc5 = 0.f, acc6 = 0.f, acc7 = 0.f;
+
+  const uint sm = sg_id >> 1u;       // SG M-index (0..1)
+  const uint sn = sg_id & 1u;        // SG N-index (0..1)
+  const uint lane_in_tg = sg_id * 32u + lane;
+
+  const uint qid = lane >> 2u;
+  const uint fm  = (qid & 4u) + ((lane >> 1u) & 3u);
+  const uint fn0 = ((qid & 2u) << 1u) + ((lane & 1u) << 1u);
+  const uint fn1 = fn0 + 1u;
+  const uint moff0 = sm * 16u + fm;
+  const uint moff1 = moff0 + 8u;
+
+  const uint m_base = tgid.y * (uint)BM;
+  const uint n_base = tgid.x * (uint)BN;
+
+  const int M = M_c, N = N_c, K = K_c;
+  const int n_groups = K / group_size;
+
+  const uint om0 = m_base + moff0;
+  const uint om1 = m_base + moff1;
+  const uint on0  = n_base + sn * 16u + fn0;
+  const uint on1  = n_base + sn * 16u + fn1;
+  const uint on80 = on0 + 8u;
+  const uint on81 = on1 + 8u;
+
+  for (int g = 0; g < n_groups; g++) {
+    // ---- Pre-build byte 0's tables into buffer 0 ----
+    lut2_build_byte<T, group_size, TBL_P>(x, M, K, g, 0u, 0u, m_base, lane_in_tg, tables, x4s);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint b = 0; b < (uint)bpg; b++) {
+      // ---- Gather byte b's contribution from buffer (b&1) ----
+      {
+        const uint buf  = b & 1u;
+        const uint woff = (uint)(g * bpg) + b;
+        // The 4 N-columns' byte values + scales (guarded like qmm_t5_impl).
+        uint bv0 = 0u, bv1 = 0u, bv2 = 0u, bv3 = 0u;
+        float sc0 = 0.f, sc1 = 0.f, sc2 = 0.f, sc3 = 0.f;
+        const uint ng = (uint)n_groups;
+        const uint wrow = (uint)(n_groups * bpg);
+        if (on0  < (uint)N) { bv0 = (uint)w[on0  * wrow + woff]; sc0 = float(scales[on0  * ng + (uint)g]); }
+        if (on1  < (uint)N) { bv1 = (uint)w[on1  * wrow + woff]; sc1 = float(scales[on1  * ng + (uint)g]); }
+        if (on80 < (uint)N) { bv2 = (uint)w[on80 * wrow + woff]; sc2 = float(scales[on80 * ng + (uint)g]); }
+        if (on81 < (uint)N) { bv3 = (uint)w[on81 * wrow + woff]; sc3 = float(scales[on81 * ng + (uint)g]); }
+
+        // Pair-table row pointers for this thread's two M-rows (threadgroup
+        // address space must be explicit on derived pointers in Metal).
+        const threadgroup float* t0r0 = tables + ((buf * 2u)      * 32u + moff0) * (uint)TBL_P;
+        const threadgroup float* t1r0 = tables + ((buf * 2u + 1u) * 32u + moff0) * (uint)TBL_P;
+        const threadgroup float* t0r1 = tables + ((buf * 2u)      * 32u + moff1) * (uint)TBL_P;
+        const threadgroup float* t1r1 = tables + ((buf * 2u + 1u) * 32u + moff1) * (uint)TBL_P;
+        const float x4m0 = x4s[buf * 32u + moff0];
+        const float x4m1 = x4s[buf * 32u + moff1];
+
+        // Decode each byte to pair indices + singleton trit via T5_TO_B4.
+        const uint p0 = T5_TO_B4[bv0];
+        const uint qa0 = 3u * (p0 & 3u) + ((p0 >> 2u) & 3u);
+        const uint qb0 = 3u * ((p0 >> 4u) & 3u) + ((p0 >> 6u) & 3u);
+        const uint s0  = (p0 >> 8u) & 3u;
+        const float sg00 = (s0 == 2u) ? x4m0 : ((s0 == 1u) ? 0.f : -x4m0);
+        const float sg01 = (s0 == 2u) ? x4m1 : ((s0 == 1u) ? 0.f : -x4m1);
+        acc0 += sc0 * (t0r0[qa0] + t1r0[qb0] + sg00);
+        acc4 += sc0 * (t0r1[qa0] + t1r1[qb0] + sg01);
+
+        const uint p1 = T5_TO_B4[bv1];
+        const uint qa1 = 3u * (p1 & 3u) + ((p1 >> 2u) & 3u);
+        const uint qb1 = 3u * ((p1 >> 4u) & 3u) + ((p1 >> 6u) & 3u);
+        const uint s1  = (p1 >> 8u) & 3u;
+        const float sg10 = (s1 == 2u) ? x4m0 : ((s1 == 1u) ? 0.f : -x4m0);
+        const float sg11 = (s1 == 2u) ? x4m1 : ((s1 == 1u) ? 0.f : -x4m1);
+        acc1 += sc1 * (t0r0[qa1] + t1r0[qb1] + sg10);
+        acc5 += sc1 * (t0r1[qa1] + t1r1[qb1] + sg11);
+
+        const uint p2 = T5_TO_B4[bv2];
+        const uint qa2 = 3u * (p2 & 3u) + ((p2 >> 2u) & 3u);
+        const uint qb2 = 3u * ((p2 >> 4u) & 3u) + ((p2 >> 6u) & 3u);
+        const uint s2  = (p2 >> 8u) & 3u;
+        const float sg20 = (s2 == 2u) ? x4m0 : ((s2 == 1u) ? 0.f : -x4m0);
+        const float sg21 = (s2 == 2u) ? x4m1 : ((s2 == 1u) ? 0.f : -x4m1);
+        acc2 += sc2 * (t0r0[qa2] + t1r0[qb2] + sg20);
+        acc6 += sc2 * (t0r1[qa2] + t1r1[qb2] + sg21);
+
+        const uint p3 = T5_TO_B4[bv3];
+        const uint qa3 = 3u * (p3 & 3u) + ((p3 >> 2u) & 3u);
+        const uint qb3 = 3u * ((p3 >> 4u) & 3u) + ((p3 >> 6u) & 3u);
+        const uint s3  = (p3 >> 8u) & 3u;
+        const float sg30 = (s3 == 2u) ? x4m0 : ((s3 == 1u) ? 0.f : -x4m0);
+        const float sg31 = (s3 == 2u) ? x4m1 : ((s3 == 1u) ? 0.f : -x4m1);
+        acc3 += sc3 * (t0r0[qa3] + t1r0[qb3] + sg30);
+        acc7 += sc3 * (t0r1[qa3] + t1r1[qb3] + sg31);
+      }
+
+      // ---- Build byte b+1's tables into buffer (b+1)&1 (ping-pong) ----
+      if (b + 1u < (uint)bpg) {
+        lut2_build_byte<T, group_size, TBL_P>(
+            x, M, K, g, b + 1u, (b + 1u) & 1u, m_base, lane_in_tg, tables, x4s);
+      }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+  }
+
+  // ---- Write output (same fragment->memory mapping as qmm_t5_impl) ----
+  if (om0 < (uint)M) {
+    if (on0  < (uint)N) out[om0 * N + on0 ] = T(acc0);
+    if (on1  < (uint)N) out[om0 * N + on1 ] = T(acc1);
+    if (on80 < (uint)N) out[om0 * N + on80] = T(acc2);
+    if (on81 < (uint)N) out[om0 * N + on81] = T(acc3);
+  }
+  if (om1 < (uint)M) {
+    if (on0  < (uint)N) out[om1 * N + on0 ] = T(acc4);
+    if (on1  < (uint)N) out[om1 * N + on1 ] = T(acc5);
+    if (on80 < (uint)N) out[om1 * N + on80] = T(acc6);
+    if (on81 < (uint)N) out[om1 * N + on81] = T(acc7);
+  }
+}
+// ---------------------------------------------------------------------------
+// qmm_t5_nomul_impl: multiplication-free select/add GEMM (μ=1 fallback).
+//
+// out[M, N] = x[M, K] @ t5_decode(w[N, K]).T  (float32 accumulate)
+//
+// FairyFuse-style fallback for the LUT-gather path: no lookup tables at all.
+// The group's x tile is staged once per K-group in threadgroup memory (xs,
+// same load as qmm_t5_impl), each t5 byte is decoded through T5_TO_B4, and
+// every output element accumulates its 5 trit contributions with pure
+// select/add (trit-1 ∈ {-1,0,1} → x, 0, -x):
+//
+//   val = (t0==2)? x0 : (t0==1)? 0 : -x0
+//       + (t1==2)? x1 : (t1==1)? 0 : -x1
+//       + ...  (5 terms, no multiply)
+//   acc += scale[n, g] * val          // single FMA per output per byte
+//
+// The xs tile is read-only across the byte loop → only 2 barriers per K-group
+// (same as qmm_t5_impl). Guarded at the group boundary so the partial last
+// byte's padding trits contribute zero.
+//
+// Grid: (ceil(N/32), ceil(M/32), B)  Threadgroup: (32, 4, 1) — identical to
+// qmm_t5_impl; fragment layout (sm, sn, fm, fn0, fn1) as in qmm_t5_lut_impl.
+// ---------------------------------------------------------------------------
+template <typename T, int group_size>
+METAL_FUNC void qmm_t5_nomul_impl(
+    const device uint8_t* w,    // (N, n_groups * bpg) t5 bytes
+    const device T* scales,     // (N, n_groups)
+    const device T* x,          // (M, K)
+    device T* out,              // (M, N)
+    const constant int& M_c,
+    const constant int& N_c,
+    const constant int& K_c,
+    threadgroup T* xs,          // BM*(group_size+4) — staged x tile (caller)
+    uint2 tgid,                  // (n_tile, m_tile)
+    uint  lane,                  // thread_index_in_simdgroup  (0..31)
+    uint  sg_id)                 // simdgroup_index_in_threadgroup (0..3)
+{
+  constexpr int bpg    = (group_size + 4) / 5;   // bytes per group
+  constexpr int xs_ld  = group_size + 4;          // padded stride for xs
+  constexpr int BM = 32, BN = 32;
+  (void)BM; (void)BN;
+
+  float acc0 = 0.f, acc1 = 0.f, acc2 = 0.f, acc3 = 0.f;
+  float acc4 = 0.f, acc5 = 0.f, acc6 = 0.f, acc7 = 0.f;
+
+  const uint sm = sg_id >> 1u;
+  const uint sn = sg_id & 1u;
+  const uint lane_in_tg = sg_id * 32u + lane;
+
+  const uint qid = lane >> 2u;
+  const uint fm  = (qid & 4u) + ((lane >> 1u) & 3u);
+  const uint fn0 = ((qid & 2u) << 1u) + ((lane & 1u) << 1u);
+  const uint fn1 = fn0 + 1u;
+  const uint moff0 = sm * 16u + fm;
+  const uint moff1 = moff0 + 8u;
+
+  const uint m_base = tgid.y * (uint)BM;
+  const uint n_base = tgid.x * (uint)BN;
+
+  const int M = M_c, N = N_c, K = K_c;
+  const int n_groups = K / group_size;
+
+  const uint tl_row     = lane_in_tg >> 2u;
+  const uint tl_sub     = lane_in_tg & 3u;
+  const uint k_sub_size = (uint)(group_size >> 2);
+
+  const uint om0 = m_base + moff0;
+  const uint om1 = m_base + moff1;
+  const uint on0  = n_base + sn * 16u + fn0;
+  const uint on1  = n_base + sn * 16u + fn1;
+  const uint on80 = on0 + 8u;
+  const uint on81 = on1 + 8u;
+
+  for (int g = 0; g < n_groups; g++) {
+    // ---- Stage X tile into xs (identical to qmm_t5_impl) ----
+    {
+      const uint m_row = m_base + tl_row;
+      const bool m_ok  = m_row < (uint)M;
+      const uint k_off = (uint)(g * group_size) + tl_sub * k_sub_size;
+      const device T* xp = x + min(m_row, (uint)(M - 1)) * (uint)K + k_off;
+      const uint xs_dst  = tl_row * xs_ld + tl_sub * k_sub_size;
+      for (uint i = 0; i < k_sub_size; i++) {
+        xs[xs_dst + i] = m_ok ? xp[i] : T(0);
+      }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // ---- Per-byte select/add accumulation (no table, no multiply) ----
+    for (uint b = 0; b < (uint)bpg; b++) {
+      // xs is staged per K-group, so index it relative to the group start.
+      const uint kbase = b * 5u;                       // group-relative
+      const uint gend  = (uint)group_size;             // group end (relative)
+      // This thread's two M-rows' 5 x values for this byte (guarded).
+      const threadgroup T* xr0 = xs + moff0 * (uint)xs_ld + kbase;
+      const threadgroup T* xr1 = xs + moff1 * (uint)xs_ld + kbase;
+      float x0 = float(xr0[0]), x1 = float(xr0[1]), x2 = float(xr0[2]);
+      float x3 = (kbase + 3u < gend) ? float(xr0[3]) : 0.f;
+      float x4 = (kbase + 4u < gend) ? float(xr0[4]) : 0.f;
+      float y0 = float(xr1[0]), y1 = float(xr1[1]), y2 = float(xr1[2]);
+      float y3 = (kbase + 3u < gend) ? float(xr1[3]) : 0.f;
+      float y4 = (kbase + 4u < gend) ? float(xr1[4]) : 0.f;
+
+      const uint woff = (uint)(g * bpg) + b;
+      uint bv0 = 0u, bv1 = 0u, bv2 = 0u, bv3 = 0u;
+      float sc0 = 0.f, sc1 = 0.f, sc2 = 0.f, sc3 = 0.f;
+      const uint ng = (uint)n_groups;
+      const uint wrow = (uint)(n_groups * bpg);
+      if (on0  < (uint)N) { bv0 = (uint)w[on0  * wrow + woff]; sc0 = float(scales[on0  * ng + (uint)g]); }
+      if (on1  < (uint)N) { bv1 = (uint)w[on1  * wrow + woff]; sc1 = float(scales[on1  * ng + (uint)g]); }
+      if (on80 < (uint)N) { bv2 = (uint)w[on80 * wrow + woff]; sc2 = float(scales[on80 * ng + (uint)g]); }
+      if (on81 < (uint)N) { bv3 = (uint)w[on81 * wrow + woff]; sc3 = float(scales[on81 * ng + (uint)g]); }
+
+      const uint p0 = T5_TO_B4[bv0];
+      const uint t00 = p0 & 3u, t01 = (p0 >> 2u) & 3u, t02 = (p0 >> 4u) & 3u;
+      const uint t03 = (p0 >> 6u) & 3u, t04 = (p0 >> 8u) & 3u;
+      float v0 = ((t00 == 2u) ? x0 : ((t00 == 1u) ? 0.f : -x0))
+               + ((t01 == 2u) ? x1 : ((t01 == 1u) ? 0.f : -x1))
+               + ((t02 == 2u) ? x2 : ((t02 == 1u) ? 0.f : -x2))
+               + ((t03 == 2u) ? x3 : ((t03 == 1u) ? 0.f : -x3))
+               + ((t04 == 2u) ? x4 : ((t04 == 1u) ? 0.f : -x4));
+      float w0 = ((t00 == 2u) ? y0 : ((t00 == 1u) ? 0.f : -y0))
+               + ((t01 == 2u) ? y1 : ((t01 == 1u) ? 0.f : -y1))
+               + ((t02 == 2u) ? y2 : ((t02 == 1u) ? 0.f : -y2))
+               + ((t03 == 2u) ? y3 : ((t03 == 1u) ? 0.f : -y3))
+               + ((t04 == 2u) ? y4 : ((t04 == 1u) ? 0.f : -y4));
+      acc0 += sc0 * v0;
+      acc4 += sc0 * w0;
+
+      const uint p1 = T5_TO_B4[bv1];
+      const uint t10 = p1 & 3u, t11 = (p1 >> 2u) & 3u, t12 = (p1 >> 4u) & 3u;
+      const uint t13 = (p1 >> 6u) & 3u, t14 = (p1 >> 8u) & 3u;
+      float v1 = ((t10 == 2u) ? x0 : ((t10 == 1u) ? 0.f : -x0))
+               + ((t11 == 2u) ? x1 : ((t11 == 1u) ? 0.f : -x1))
+               + ((t12 == 2u) ? x2 : ((t12 == 1u) ? 0.f : -x2))
+               + ((t13 == 2u) ? x3 : ((t13 == 1u) ? 0.f : -x3))
+               + ((t14 == 2u) ? x4 : ((t14 == 1u) ? 0.f : -x4));
+      float w1 = ((t10 == 2u) ? y0 : ((t10 == 1u) ? 0.f : -y0))
+               + ((t11 == 2u) ? y1 : ((t11 == 1u) ? 0.f : -y1))
+               + ((t12 == 2u) ? y2 : ((t12 == 1u) ? 0.f : -y2))
+               + ((t13 == 2u) ? y3 : ((t13 == 1u) ? 0.f : -y3))
+               + ((t14 == 2u) ? y4 : ((t14 == 1u) ? 0.f : -y4));
+      acc1 += sc1 * v1;
+      acc5 += sc1 * w1;
+
+      const uint p2 = T5_TO_B4[bv2];
+      const uint t20 = p2 & 3u, t21 = (p2 >> 2u) & 3u, t22 = (p2 >> 4u) & 3u;
+      const uint t23 = (p2 >> 6u) & 3u, t24 = (p2 >> 8u) & 3u;
+      float v2 = ((t20 == 2u) ? x0 : ((t20 == 1u) ? 0.f : -x0))
+               + ((t21 == 2u) ? x1 : ((t21 == 1u) ? 0.f : -x1))
+               + ((t22 == 2u) ? x2 : ((t22 == 1u) ? 0.f : -x2))
+               + ((t23 == 2u) ? x3 : ((t23 == 1u) ? 0.f : -x3))
+               + ((t24 == 2u) ? x4 : ((t24 == 1u) ? 0.f : -x4));
+      float w2 = ((t20 == 2u) ? y0 : ((t20 == 1u) ? 0.f : -y0))
+               + ((t21 == 2u) ? y1 : ((t21 == 1u) ? 0.f : -y1))
+               + ((t22 == 2u) ? y2 : ((t22 == 1u) ? 0.f : -y2))
+               + ((t23 == 2u) ? y3 : ((t23 == 1u) ? 0.f : -y3))
+               + ((t24 == 2u) ? y4 : ((t24 == 1u) ? 0.f : -y4));
+      acc2 += sc2 * v2;
+      acc6 += sc2 * w2;
+
+      const uint p3 = T5_TO_B4[bv3];
+      const uint t30 = p3 & 3u, t31 = (p3 >> 2u) & 3u, t32 = (p3 >> 4u) & 3u;
+      const uint t33 = (p3 >> 6u) & 3u, t34 = (p3 >> 8u) & 3u;
+      float v3 = ((t30 == 2u) ? x0 : ((t30 == 1u) ? 0.f : -x0))
+               + ((t31 == 2u) ? x1 : ((t31 == 1u) ? 0.f : -x1))
+               + ((t32 == 2u) ? x2 : ((t32 == 1u) ? 0.f : -x2))
+               + ((t33 == 2u) ? x3 : ((t33 == 1u) ? 0.f : -x3))
+               + ((t34 == 2u) ? x4 : ((t34 == 1u) ? 0.f : -x4));
+      float w3 = ((t30 == 2u) ? y0 : ((t30 == 1u) ? 0.f : -y0))
+               + ((t31 == 2u) ? y1 : ((t31 == 1u) ? 0.f : -y1))
+               + ((t32 == 2u) ? y2 : ((t32 == 1u) ? 0.f : -y2))
+               + ((t33 == 2u) ? y3 : ((t33 == 1u) ? 0.f : -y3))
+               + ((t34 == 2u) ? y4 : ((t34 == 1u) ? 0.f : -y4));
+      acc3 += sc3 * v3;
+      acc7 += sc3 * w3;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+
+  // ---- Write output (same fragment->memory mapping as qmm_t5_impl) ----
+  if (om0 < (uint)M) {
+    if (on0  < (uint)N) out[om0 * N + on0 ] = T(acc0);
+    if (on1  < (uint)N) out[om0 * N + on1 ] = T(acc1);
+    if (on80 < (uint)N) out[om0 * N + on80] = T(acc2);
+    if (on81 < (uint)N) out[om0 * N + on81] = T(acc3);
+  }
+  if (om1 < (uint)M) {
+    if (on0  < (uint)N) out[om1 * N + on0 ] = T(acc4);
+    if (on1  < (uint)N) out[om1 * N + on1 ] = T(acc5);
+    if (on80 < (uint)N) out[om1 * N + on80] = T(acc6);
+    if (on81 < (uint)N) out[om1 * N + on81] = T(acc7);
+  }
+}
+
+
 template <typename T, const int group_size, const int bits>
 METAL_FUNC void qvm_impl(
     const device uint32_t* w,

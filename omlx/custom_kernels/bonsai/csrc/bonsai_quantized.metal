@@ -257,6 +257,80 @@ template <typename T, int group_size>
   bonsai_instantiate_qmm_t5(float16_t, gs)     \
   bonsai_instantiate_qmm_t5(bfloat16_t, gs)
 
+// ---- t5 LUT-GEMM (Identity I-M, paired-trit μ=2): prefill variant ----
+// Same buffer layout and grid as affine_qmm_t5; ping-pong pair tables live in
+// threadgroup memory declared here (Metal requires [[kernel]] scope).
+
+template <typename T, int group_size>
+[[kernel]] void affine_qmm_t5_lut(
+    const device uint8_t* w  [[buffer(0)]],
+    const device T* scales   [[buffer(1)]],
+    const device T* x        [[buffer(2)]],
+    device T* out            [[buffer(3)]],
+    const constant int& M    [[buffer(4)]],
+    const constant int& N    [[buffer(5)]],
+    const constant int& K    [[buffer(6)]],
+    uint2 tgid               [[threadgroup_position_in_grid]],
+    uint  lane               [[thread_index_in_simdgroup]],
+    uint  sg_id              [[simdgroup_index_in_threadgroup]])
+{
+    // Ping-pong pair tables: 2 bufs x 2 pairs x 32 rows x 33-float pitch
+    // (17.0 KB) + 2 x 32-float singleton-x4 staging (0.25 KB) = 17.2 KB.
+    threadgroup float tables[2 * 2 * 32 * 33];
+    threadgroup float x4s[2 * 32];
+    qmm_t5_lut_impl<T, group_size>(
+        w, scales, x, out, M, N, K, tables, x4s, tgid, lane, sg_id);
+}
+
+#define bonsai_instantiate_qmm_t5_lut(type, gs) \
+  instantiate_kernel(                            \
+      "affine_qmm_t5_lut_" #type "_gs_" #gs,    \
+      affine_qmm_t5_lut, type, gs)
+
+#define bonsai_qmm_t5_lut_types(gs)             \
+  bonsai_instantiate_qmm_t5_lut(float, gs)      \
+  bonsai_instantiate_qmm_t5_lut(float16_t, gs)  \
+  bonsai_instantiate_qmm_t5_lut(bfloat16_t, gs)
+
+bonsai_qmm_t5_lut_types(64)
+bonsai_qmm_t5_lut_types(128)
+
+// ---- t5 select/add GEMM (Identity I-M, μ=1): multiplication-free fallback ----
+// Same buffer layout and grid as affine_qmm_t5; stages the x tile per K-group
+// (no tables at all — pure select/add with a single per-row scale FMA).
+
+template <typename T, int group_size>
+[[kernel]] void affine_qmm_t5_nomul(
+    const device uint8_t* w  [[buffer(0)]],
+    const device T* scales   [[buffer(1)]],
+    const device T* x        [[buffer(2)]],
+    device T* out            [[buffer(3)]],
+    const constant int& M    [[buffer(4)]],
+    const constant int& N    [[buffer(5)]],
+    const constant int& K    [[buffer(6)]],
+    uint2 tgid               [[threadgroup_position_in_grid]],
+    uint  lane               [[thread_index_in_simdgroup]],
+    uint  sg_id              [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup T xs[32 * (group_size + 4)];
+    qmm_t5_nomul_impl<T, group_size>(
+        w, scales, x, out, M, N, K, xs, tgid, lane, sg_id);
+}
+
+#define bonsai_instantiate_qmm_t5_nomul(type, gs) \
+  instantiate_kernel(                              \
+      "affine_qmm_t5_nomul_" #type "_gs_" #gs,    \
+      affine_qmm_t5_nomul, type, gs)
+
+#define bonsai_qmm_t5_nomul_types(gs)           \
+  bonsai_instantiate_qmm_t5_nomul(float, gs)    \
+  bonsai_instantiate_qmm_t5_nomul(float16_t, gs)\
+  bonsai_instantiate_qmm_t5_nomul(bfloat16_t, gs)
+
+bonsai_qmm_t5_nomul_types(64)
+bonsai_qmm_t5_nomul_types(128)
+
+
 bonsai_qmm_t5_types(64)
 bonsai_qmm_t5_types(128)
 // clang-format on

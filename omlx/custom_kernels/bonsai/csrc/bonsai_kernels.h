@@ -139,6 +139,29 @@ array bonsai_t5_qmm(
     const array& scales,
     StreamOrDevice s = {});
 
+// ---------------------------------------------------------------------------
+// t5 LUT-GEMM (Identity I-M, paired-trit μ=2): prefill variant
+// ---------------------------------------------------------------------------
+// Same layout/arguments as bonsai_t5_qmm. LUT-gather dataflow: replaces the
+// per-trit dequant + simdgroup MMA with 9-entry pair tables (see
+// qmm_t5_lut_impl in quantized.h).
+array bonsai_t5_qmm_lut(
+    const array& x,
+    const array& w,
+    const array& scales,
+    StreamOrDevice s = {});
+
+// ---------------------------------------------------------------------------
+// t5 select/add GEMM (Identity I-M, μ=1): multiplication-free fallback
+// ---------------------------------------------------------------------------
+// Same layout/arguments as bonsai_t5_qmm. No lookup tables — pure select/add
+// per trit with one per-row scale FMA (see qmm_t5_nomul_impl in quantized.h).
+array bonsai_t5_qmm_nomul(
+    const array& x,
+    const array& w,
+    const array& scales,
+    StreamOrDevice s = {});
+
 std::pair<array, array> bonsai_spec_decode_verify(
     const array& draft,
     const array& target,
