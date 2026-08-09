@@ -100,7 +100,7 @@ def main():
         print("bonsai native extension unavailable — rebuild with "
               "OMLX_WITH_CUSTOM_KERNEL=1", file=sys.stderr)
         sys.exit(1)
-    for sym in ("bonsai_t5_qmm", "bonsai_t5_qmm_lut", "bonsai_t5_qmm_nomul"):
+    for sym in ("bonsai_t5_qmm", "bonsai_t5_qmm_lut", "bonsai_t5_qmm_nomul", "bonsai_t5_qmm_steel"):
         if not bf.has_symbol(sym):
             print(f"missing native symbol {sym}", file=sys.stderr)
             sys.exit(1)
@@ -116,21 +116,25 @@ def main():
             mx.eval(x, w, scales)
 
             results = {}
-            for name in ("bonsai_t5_qmm", "bonsai_t5_qmm_lut", "bonsai_t5_qmm_nomul"):
+            for name in ("bonsai_t5_qmm", "bonsai_t5_qmm_lut", "bonsai_t5_qmm_nomul",
+                         "bonsai_t5_qmm_steel"):
                 fn = getattr(bf, name)
                 results[name] = time_fn(lambda: fn(x, w, scales), args.warmup, args.iters)
 
             ms_ref = results["bonsai_t5_qmm"] * 1e3
             ms_lut = results["bonsai_t5_qmm_lut"] * 1e3
             ms_nom = results["bonsai_t5_qmm_nomul"] * 1e3
+            ms_stl = results["bonsai_t5_qmm_steel"] * 1e3
             tok_s = lambda ms: 1000.0 * M / ms
             gflop = lambda ms: 2.0 * M * N * K / (ms * 1e-3) / 1e9
             ratio_lut = f"{ms_lut / ms_ref:.2f}x" if ms_ref > 0 else ""
             ratio_nom = f"{ms_nom / ms_ref:.2f}x" if ms_ref > 0 else ""
+            ratio_stl = f"{ms_stl / ms_ref:.2f}x" if ms_ref > 0 else ""
             for name, ms, ratio in (
                 ("qmm (MMA)", ms_ref, ""),
                 ("qmm_lut (μ2)", ms_lut, ratio_lut),
                 ("qmm_nomul (μ1)", ms_nom, ratio_nom),
+                ("qmm_steel", ms_stl, ratio_stl),
             ):
                 rows.append(Row(M, N, K, gs, name, ms, tok_s(ms), gflop(ms), ratio))
 

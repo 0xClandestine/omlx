@@ -162,6 +162,18 @@ array bonsai_t5_qmm_nomul(
     const array& scales,
     StreamOrDevice s = {});
 
+// ---------------------------------------------------------------------------
+// t5 steel GEMM (Identity I-M): packed t5 weights on the mlx steel pipeline
+// ---------------------------------------------------------------------------
+// Same layout/arguments as bonsai_t5_qmm. qmm_t5_steel_impl drives the stock
+// BlockMMA/loader schedule used by mlx's bits=2 quantized_matmul (measured
+// ~45% faster than the bespoke qmm_t5_impl on M4-class silicon).
+array bonsai_t5_qmm_steel(
+    const array& x,
+    const array& w,
+    const array& scales,
+    StreamOrDevice s = {});
+
 std::pair<array, array> bonsai_spec_decode_verify(
     const array& draft,
     const array& target,

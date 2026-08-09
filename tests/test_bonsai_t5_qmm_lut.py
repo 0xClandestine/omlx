@@ -55,14 +55,16 @@ def _t5_tensors(M, K, N, group_size, dtype, seed):
 @pytest.mark.parametrize(("M", "K", "N", "group_size"), SHAPES_GS)
 @pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
 def test_lut_matches_reference(M, K, N, group_size, dtype):
-    if not (bf.has_native() and bf.has_symbol("bonsai_t5_qmm_lut")
-            and bf.has_symbol("bonsai_t5_qmm_nomul")):
+    if not (bf.has_native()
+            and all(bf.has_symbol(s) for s in
+                    ("bonsai_t5_qmm_lut", "bonsai_t5_qmm_nomul", "bonsai_t5_qmm_steel"))):
         pytest.skip("t5 qmm native extensions not available")
     x, w, scales = _t5_tensors(M, K, N, group_size, dtype, seed=42)
     ref = bf.bonsai_t5_qmm(x, w, scales)
     lut = bf.bonsai_t5_qmm_lut(x, w, scales)
     nom = bf.bonsai_t5_qmm_nomul(x, w, scales)
-    mx.eval(ref, lut, nom)
+    stl = bf.bonsai_t5_qmm_steel(x, w, scales)
+    mx.eval(ref, lut, nom, stl)
     assert lut.shape == ref.shape == (M, N)
     # mlx-native comparison (np.asarray on fp16 hits a numpy>=2 buffer-format
     # quirk with mlx 0.32; mx.allclose avoids the interop entirely).
@@ -74,6 +76,10 @@ def test_lut_matches_reference(M, K, N, group_size, dtype):
     assert mx.all(mx.less(mx.abs(nom - ref), tol)).item(), (
         f"nomul vs reference mismatch (M={M}, K={K}, N={N}, gs={group_size}, {dtype}): "
         f"max abs {mx.max(mx.abs(nom - ref)).item():.3e}"
+    )
+    assert mx.all(mx.less(mx.abs(stl - ref), tol)).item(), (
+        f"steel vs reference mismatch (M={M}, K={K}, N={N}, gs={group_size}, {dtype}): "
+        f"max abs {mx.max(mx.abs(stl - ref)).item():.3e}"
     )
 
 

@@ -2389,6 +2389,246 @@ METAL_FUNC void qmm_t_impl(
   }
 }
 
+// ---------------------------------------------------------------------------
+// T5BlockLoader: steel B-tile loader for t5 base-3 weights.
+//
+// Mirrors QuantizedBlockLoader's load_unsafe/load_safe/next contract for the
+// mlx steel BlockMMA pipeline, but decodes Bonsai t5 bytes (5 trits per byte,
+// byte range 0..242, ~1.585 bpw) instead of uniform-bit packs. Each thread
+// dequantizes VPT consecutive K-positions of one BN row into the Ws tile:
+//
+//   dst[j] = scale * (trit_k(w_byte) - 1),  trit ∈ {0,1,2} -> {-1,0,1}
+//
+// tile K-offsets are group-aligned (BK | group_size), so every thread's VPT
+// values lie inside one K-group — byte index = g*bpg + p/5, trit = p%5 with
+// the magic (p*103)>>9 div-by-5 (exact for p ≤ 854). Scales advance once per
+// group (group_steps = group_size/BCOLS), mirroring QuantizedBlockLoader.
+// ---------------------------------------------------------------------------
+template <typename T, short BROWS, short BCOLS, short dst_ld, short reduction_dim,
+          short tgp_size, short group_size, short bpg>
+struct T5BlockLoader {
+  static_assert(group_size % BCOLS == 0, "group_size must be divisible by BCOLS");
+
+  MLX_MTL_CONST short VPT = (BROWS * BCOLS) / tgp_size;  // 8 for 32x32/128
+  MLX_MTL_CONST short group_steps = group_size / BCOLS;
+
+  const int src_ld;          // bytes per w row (n_groups * bpg)
+  const int scale_ld;        // n_groups
+  const short thread_idx;
+  const short bi;            // BROWS-row this thread loads
+  const short bj;            // BCOLS-col of its first value
+
+  threadgroup T* dst;
+  const device uint8_t* src;
+  const device T* scales;
+  int k_abs;                 // absolute K of the tile start
+  int g_abs;                 // group index of k_abs
+  short group_step_cnt;
+
+  T5BlockLoader(
+      const device uint8_t* src_,
+      const device T* scales_,
+      const int src_ld_,
+      const int scale_ld_,
+      const int k_start_,
+      threadgroup T* dst_,
+      ushort simd_group_id,
+      ushort simd_lane_id)
+      : src_ld(src_ld_),
+        scale_ld(scale_ld_),
+        thread_idx(simd_group_id * 32 + simd_lane_id),
+        bi((thread_idx * VPT) / BCOLS),
+        bj((thread_idx * VPT) % BCOLS),
+        dst(dst_ + bi * dst_ld + bj),
+        src(src_ + bi * src_ld),
+        scales(scales_ + bi * scale_ld),
+        k_abs(k_start_),
+        g_abs(k_start_ / group_size),
+        group_step_cnt(0) {}
+
+  void next() {
+    k_abs += BCOLS;
+    group_step_cnt++;
+    if (group_step_cnt == group_steps) {
+      group_step_cnt = 0;
+      g_abs++;
+      scales++;
+    }
+  }
+
+  void load_unsafe() const {
+    load_impl();
+  }
+
+  void load_safe(short2 src_tile_dim) const {
+    if (reduction_dim == 1 && bi >= src_tile_dim.y) {
+      for (short j = 0; j < VPT; j++) {
+        dst[j] = T(0);
+      }
+      return;
+    }
+    if (reduction_dim == 0 && bi >= src_tile_dim.x) {
+      for (short j = 0; j < VPT; j++) {
+        dst[j] = T(0);
+      }
+      return;
+    }
+    load_impl();
+  }
+
+  void load_impl() const {
+    // k_abs is group-aligned and the whole group is in bounds, so no partial
+    // (epoch/last-byte) guard is needed: positions never reach the padding
+    // trits of the group's final byte.
+    const int r0 = k_abs - g_abs * group_size + bj;  // first value, in-group
+    // by below is the absolute in-group byte index (rj/5), so base the row
+    // pointer at the group's first byte — NOT at byte r0/5 (double-counting
+    // that offset was the original bug: it read 2x into the group).
+    const device uint8_t* wb_p = src + g_abs * bpg;
+    T scale = *scales;
+#pragma clang loop unroll(full)
+    for (short j = 0; j < VPT; j++) {
+      const int rj = r0 + j;                 // in-group position
+      const int by = (rj * 103) >> 9;        // rj/5, exact for rj ≤ 854
+      const int tr = rj - by * 5;            // rj%5
+      const uint pv = T5_TO_B4[wb_p[by]];
+      const int q = (pv >> (2 * tr)) & 3;    // trit ∈ {0,1,2}
+      dst[j] = T(scale * (float(q) - 1.f));
+    }
+  }
+};
+
+// ---------------------------------------------------------------------------
+// qmm_t5_steel_impl: t5 GEMM on the mlx steel BlockMMA pipeline.
+//
+// Identical structure to stock mlx qmm_t_impl (BM=BN=BK=32, WM=WN=2, steel
+// BlockMMA with double-buffered threadgroup tiles) but with T5BlockLoader
+// replacing QuantizedBlockLoader and no bias tensor. Keeps the packed t5
+// format in memory (~1.585 bpw) while getting the tuned load/MMA schedule
+// that stock bits=2 qmm uses — the bespoke qmm_t5_impl reaches ~60% of it.
+// ---------------------------------------------------------------------------
+template <
+    typename T,
+    const int group_size,
+    const bool aligned_N,
+    const int BM = 32,
+    const int BK = 32,
+    const int BN = 32>
+METAL_FUNC void qmm_t5_steel_impl(
+    const device uint8_t* w,
+    const device T* scales,
+    const device T* x,
+    device T* y,
+    threadgroup T* Xs,
+    threadgroup T* Ws,
+    const constant int& K,
+    const constant int& N,
+    const constant int& M,
+    const constant int& K_eff,
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint lid [[thread_index_in_threadgroup]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  static_assert(BK >= SIMD_SIZE, "BK should be larger than SIMD_SIZE");
+  static_assert(BK % SIMD_SIZE == 0, "BK should be divisible by SIMD_SIZE");
+
+  (void)lid;
+
+  constexpr int WM = 2;
+  constexpr int WN = 2;
+  constexpr int bpg = (group_size + 4) / 5;
+
+  constexpr int BK_padded = (BK + 16 / sizeof(T));
+
+  // Instantiate the appropriate BlockMMA and Loader
+  using mma_t = mlx::steel::
+      BlockMMA<T, T, BM, BN, BK, WM, WN, false, true, BK_padded, BK_padded>;
+  using loader_x_t =
+      mlx::steel::BlockLoader<T, BM, BK, BK_padded, 1, WM * WN * SIMD_SIZE>;
+  using loader_w_t = T5BlockLoader<
+      T, BN, BK, BK_padded, 1, WM * WN * SIMD_SIZE, group_size, bpg>;
+
+  // Set the block
+  const int K_w = N * (K / group_size) * bpg;  // unused — loader keeps strides
+  (void)K_w;
+  const int y_row = tid.y * BM;
+  const int y_col = tid.x * BN;
+
+  auto wl = (const device uint8_t*)w;
+
+  x += y_row * static_cast<int64_t>(K);
+  wl += y_col * (K / group_size) * bpg;
+  scales += y_col * (K / group_size);
+  y += y_row * static_cast<int64_t>(N) + y_col;
+
+  // Make the x loader and mma operation
+  const short num_els = min(BM, M - y_row);
+  const short num_outs = min(BN, N - y_col);
+  loader_x_t loader_x(x, K, Xs, simd_gid, simd_lid);
+  loader_w_t loader_w(
+      wl, scales,
+      /*src_ld=*/(K / group_size) * bpg,
+      /*scale_ld=*/(K / group_size),
+      /*k_start=*/0,
+      Ws, simd_gid, simd_lid);
+  mma_t mma_op(simd_gid, simd_lid);
+
+  if (num_els < BM) {
+    if (!aligned_N && num_outs < BN) {
+      for (int k = 0; k < K_eff; k += BK) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        loader_x.load_safe(short2(BK, num_els));
+        loader_w.load_safe(short2(BK, num_outs));
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        mma_op.mma(Xs, Ws);
+        loader_x.next();
+        loader_w.next();
+      }
+    } else {
+      for (int k = 0; k < K_eff; k += BK) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        loader_x.load_safe(short2(BK, num_els));
+        loader_w.load_unsafe();
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        mma_op.mma(Xs, Ws);
+        loader_x.next();
+        loader_w.next();
+      }
+    }
+  } else {
+    if (!aligned_N && num_outs < BN) {
+      for (int k = 0; k < K_eff; k += BK) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        loader_x.load_unsafe();
+        loader_w.load_safe(short2(BK, num_outs));
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        mma_op.mma(Xs, Ws);
+        loader_x.next();
+        loader_w.next();
+      }
+    } else {
+      for (int k = 0; k < K_eff; k += BK) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        loader_x.load_unsafe();
+        loader_w.load_unsafe();
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        mma_op.mma(Xs, Ws);
+        loader_x.next();
+        loader_w.next();
+      }
+    }
+  }
+
+  // Store results to device memory
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (num_els < BM || num_outs < BN) {
+    mma_op.store_result_safe(y, N, short2(num_outs, num_els));
+  } else {
+    mma_op.store_result(y, N);
+  }
+}
+
 template <
     typename T,
     const int group_size,

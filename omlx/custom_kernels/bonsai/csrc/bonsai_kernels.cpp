@@ -534,6 +534,13 @@ static std::string qmm_t5_nomul_kname(const std::string& type, int group_size) {
     return "affine_qmm_t5_nomul_" + type + "_gs_" + std::to_string(group_size);
 }
 
+// affine_qmm_t5_steel_<type>_gs_<gs>_alN_<true|false>
+static std::string qmm_t5_steel_kname(
+    const std::string& type, int group_size, bool aligned_N) {
+    return "affine_qmm_t5_steel_" + type + "_gs_" + std::to_string(group_size)
+        + "_alN_" + (aligned_N ? "true" : "false");
+}
+
 static void dispatch_qmm_t5(
     const array& x,
     const array& w,
@@ -623,6 +630,72 @@ static void dispatch_qmm_t5_nomul(
     MTL::Size grid_dims((N + 31) / 32, (M + 31) / 32, 1);
     enc.dispatch_threadgroups(grid_dims, group_dims);
 }
+
+static void dispatch_qmm_t5_steel(
+    const array& x,
+    const array& w,
+    const array& scales,
+    array& out,
+    int M, int N, int K,
+    int group_size,
+    metal::Device& d,
+    const Stream& s) {
+
+    bool aligned = N % 32 == 0;
+    std::string kname = qmm_t5_steel_kname(type_str(x.dtype()), group_size, aligned);
+    auto kernel = get_bonsai_kernel(d, kname);
+    auto& enc   = metal::get_command_encoder(s);
+    enc.set_compute_pipeline_state(kernel);
+
+    int c = 0;
+    enc.set_input_array(w,      c++);
+    enc.set_input_array(scales, c++);
+    enc.set_input_array(x,      c++);
+    enc.set_output_array(out,   c++);
+    enc.set_bytes(M, c++);
+    enc.set_bytes(N, c++);
+    enc.set_bytes(K, c++);
+
+    // Grid: (ceil(N/32), ceil(M/32), 1)  TG: (32, 2, 2) — steel 2x2 tiles
+    MTL::Size group_dims(32, 2, 2);
+    MTL::Size grid_dims((N + 31) / 32, (M + 31) / 32, 1);
+    enc.dispatch_threadgroups(grid_dims, group_dims);
+}
+
+class BonsaiT5QmmSteelPrimitive : public Primitive {
+ public:
+    explicit BonsaiT5QmmSteelPrimitive(Stream s) : Primitive(s) {}
+
+ private:
+    void eval_cpu(
+        const std::vector<array>& /* inputs */,
+        std::vector<array>& /* outputs */) override {
+        throw std::runtime_error("BonsaiT5QmmSteelPrimitive has no CPU path.");
+    }
+
+    void eval_gpu(
+        const std::vector<array>& inputs,
+        std::vector<array>& outputs) override {
+        auto& s  = stream();
+        auto& d  = metal::device(s.device);
+        auto& out = outputs[0];
+        out.set_data(mlx::core::allocator::malloc(out.nbytes()));
+
+        const auto& x      = inputs[0];
+        const auto& w      = inputs[1];
+        const auto& scales = inputs[2];
+
+        int group_size = derive_t5_group_size(w, scales);
+        int N          = static_cast<int>(w.shape(-2));
+        int n_groups   = static_cast<int>(scales.shape(-1));
+        int K          = n_groups * group_size;
+        int M          = static_cast<int>(x.size()) / K;
+
+        dispatch_qmm_t5_steel(x, w, scales, out, M, N, K, group_size, d, s);
+    }
+
+    DEFINE_NAME(BonsaiT5QmmSteelPrimitive)
+};
 
 class BonsaiT5QmmNomulPrimitive : public Primitive {
  public:
@@ -963,6 +1036,22 @@ array bonsai_t5_qmm_nomul(
     out_shape.back() = N;
     return array(out_shape, x_c.dtype(),
         std::make_shared<BonsaiT5QmmNomulPrimitive>(s),
+        {x_c, w, sc});
+}
+
+array bonsai_t5_qmm_steel(
+    const array& x,
+    const array& w,
+    const array& scales,
+    StreamOrDevice s_) {
+    auto s   = to_stream(s_);
+    auto x_c = ensure_row_contiguous(x, s);
+    auto sc  = ensure_dtype(scales, x_c.dtype(), s);
+    int N = static_cast<int>(w.shape(-2));
+    auto out_shape = x_c.shape();
+    out_shape.back() = N;
+    return array(out_shape, x_c.dtype(),
+        std::make_shared<BonsaiT5QmmSteelPrimitive>(s),
         {x_c, w, sc});
 }
 

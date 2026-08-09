@@ -523,6 +523,34 @@ def bonsai_t5_qmm_nomul(
     )
 
 
+def bonsai_t5_qmm_steel(
+    x: mx.array,
+    w: mx.array,
+    scales: mx.array,
+    stream=None,
+) -> mx.array:
+    """t5 steel GEMM for prefill (Identity I-M).
+
+    Packed t5 weights on the mlx steel BlockMMA pipeline (same 32x32 tile
+    schedule as stock mlx quantized_matmul bits=2, which measurably outruns
+    the bespoke qmm_t5_impl by ~45% on M4-class silicon). Numerically
+    identical to bonsai_t5_qmm within fp16 rounding.
+
+    Parameters
+    ----------
+    x      : [M, K]                  activations (float16 or bfloat16)
+    w      : [N, n_groups*bpg]       uint8 t5 weight bytes
+    scales : [N, n_groups]           scale per group
+    Returns [M, N].
+    """
+    if _ext is not None and has_symbol("bonsai_t5_qmm_steel"):
+        return _ext.bonsai_t5_qmm_steel(x, w, scales, stream=stream)
+    raise RuntimeError(
+        "bonsai_t5_qmm_steel: native extension unavailable. "
+        "Rebuild the bonsai extension."
+    )
+
+
 # ---------------------------------------------------------------------------
 # spec_decode_verify
 # ---------------------------------------------------------------------------
